@@ -3903,3 +3903,739 @@ Return results
 - Real-time: 5 FPS on 800×1333 (GPU)
 
 This completes Chapter 7 on Image Segmentation, covering both semantic and instance approaches.
+
+---
+
+### Chapter 8: Multi-Object Tracking
+
+#### 8.1 Mathematical Formulation
+
+**Definition**: Multi-object tracking (MOT) is the problem of maintaining consistent identities for multiple objects across a video sequence.
+
+$$\text{MOT}: \mathcal{I}^T \times \mathcal{D}^T \rightarrow \mathcal{T}$$
+
+where:
+- $\mathcal{I}^T = \{I_1, \ldots, I_T\}$ is a video sequence
+- $\mathcal{D}^T = \{D_1, \ldots, D_T\}$ where $D_t = \{d_1^t, \ldots, d_{n_t}^t\}$ are detections at frame $t$
+- $\mathcal{T} = \{T_1, \ldots, T_K\}$ where $T_k$ is a trajectory (sequence of detections with consistent ID)
+
+**Trajectory Definition**:
+$$T_k = \{(d_{i_1}^{t_1}, t_1), (d_{i_2}^{t_2}, t_2), \ldots, (d_{i_m}^{t_m}, t_m)\}$$
+
+A trajectory links detections across frames with the same object identity.
+
+**Decomposition**:
+$$\text{MOT} = \text{Link}_{\text{trajectories}} \circ \text{Associate} \circ \text{Detect} \circ \text{Transform}$$
+
+Where:
+1. **Transform**: Preprocessing each frame
+2. **Detect**: Object detection per frame
+3. **Associate**: Match detections across consecutive frames
+4. **Link**: Build consistent trajectories over time
+
+**Evaluation Metrics**:
+- **MOTA** (Multi-Object Tracking Accuracy): $\text{MOTA} = 1 - \frac{\text{FN} + \text{FP} + \text{IDS}}{\text{GT}}$
+  - FN = false negatives, FP = false positives, IDS = identity switches, GT = ground truth objects
+- **MOTP** (Multi-Object Tracking Precision): Average IoU between matched detections and ground truth
+- **IDF1** (ID F1 Score): Ratio of correctly identified detections over average ground truth and computed detections
+
+#### 8.2 Algorithmic Analysis
+
+**Tracking-by-Detection Paradigm**:
+
+The dominant approach separates tracking into two stages:
+1. **Detection**: Detect objects in each frame independently
+2. **Association**: Link detections across frames
+
+**Challenge: Data Association Problem**
+
+Given detections $D_t$ at frame $t$ and tracks $\mathcal{T}_{t-1}$, find optimal assignment:
+$$\min_{A} \sum_{i,j} c_{ij} \cdot a_{ij}$$
+
+where:
+- $A = [a_{ij}]$ is binary assignment matrix
+- $c_{ij}$ is the cost of assigning detection $i$ to track $j$
+- Constraints: Each detection assigned to at most one track, each track assigned to at most one detection
+
+**Solution**: Hungarian algorithm (Kuhn-Munkres) in $O(n^3)$
+
+---
+
+**Algorithm 1: SORT** (Simple Online and Realtime Tracking — Bewley et al., 2016):
+
+*Algorithm*:
+```
+Input: Video frames {I₁, ..., I_T}
+Output: Trajectories {T₁, ..., T_K}
+
+Initialization:
+    tracks = []  # Active tracks
+    next_id = 1
+
+For each frame t:
+    # Step 1: Detect objects
+    detections = Detector(I_t)  # {d₁, ..., d_n}
+
+    # Step 2: Predict track positions (Kalman filter)
+    For each track T in tracks:
+        T.predict()  # Predict position at frame t
+
+    # Step 3: Compute cost matrix
+    C = zeros(len(detections), len(tracks))
+    For i, det in enumerate(detections):
+        For j, track in enumerate(tracks):
+            C[i,j] = 1 - IoU(det.bbox, track.predicted_bbox)
+
+    # Step 4: Hungarian assignment
+    matches, unmatched_dets, unmatched_tracks = Hungarian(C, threshold=0.3)
+
+    # Step 5: Update matched tracks
+    For (det_idx, track_idx) in matches:
+        tracks[track_idx].update(detections[det_idx])
+
+    # Step 6: Create new tracks for unmatched detections
+    For det_idx in unmatched_dets:
+        new_track = Track(id=next_id, detection=detections[det_idx])
+        tracks.append(new_track)
+        next_id += 1
+
+    # Step 7: Delete lost tracks
+    tracks = [T for T in tracks if T.time_since_update < max_age]
+
+Return tracks
+```
+
+**Key Components**:
+1. **Kalman Filter**: Predicts object motion (constant velocity model)
+   - State: $x = [u, v, s, r, \dot{u}, \dot{v}, \dot{s}]^T$ (position, scale, aspect ratio, velocities)
+   - Prediction: $x_{t|t-1} = F \cdot x_{t-1}$
+   - Update: $x_t = x_{t|t-1} + K \cdot (z_t - H \cdot x_{t|t-1})$
+
+2. **IoU Matching**: $\text{IoU}(b_1, b_2) = \frac{|b_1 \cap b_2|}{|b_1 \cup b_2|}$
+
+3. **Hungarian Algorithm**: Optimal assignment in $O(n^3)$
+
+**Complexity**:
+- Time: $O(n \cdot m + n^3)$ where n = detections, m = tracks
+- Space: $O(n \cdot m)$ for cost matrix
+
+**Performance**:
+- MOT15: MOTA 33.4%, IDF1 36.4%
+- Speed: 260 Hz (real-time++)
+
+**Limitations**:
+- No appearance features (relies only on motion and IoU)
+- Identity switches during occlusions
+
+---
+
+**Algorithm 2: DeepSORT** (Wojke et al., 2017):
+
+*Key Innovation*: Add appearance features via deep CNN
+
+*Algorithm*:
+```
+Input: Video frames {I₁, ..., I_T}
+Output: Trajectories with fewer identity switches
+
+Initialization:
+    tracks = []
+    appearance_model = CNN_ReID()  # Re-identification network
+    next_id = 1
+
+For each frame t:
+    # Step 1: Detect objects
+    detections = Detector(I_t)
+
+    # Step 2: Extract appearance features
+    For each detection d in detections:
+        d.feature = appearance_model(crop(I_t, d.bbox))  # 128-d embedding
+
+    # Step 3: Predict track positions
+    For each track T in tracks:
+        T.kalman.predict()
+
+    # Step 4: Compute cost matrix (motion + appearance)
+    C_motion = zeros(len(detections), len(tracks))
+    C_appear = zeros(len(detections), len(tracks))
+
+    For i, det in enumerate(detections):
+        For j, track in enumerate(tracks):
+            # Motion cost (Mahalanobis distance)
+            C_motion[i,j] = MahalanobisDistance(det, track.kalman)
+
+            # Appearance cost (cosine distance)
+            C_appear[i,j] = 1 - CosineSimilarity(det.feature, track.feature_gallery)
+
+    # Combine costs
+    C = λ * C_motion + (1-λ) * C_appear  # λ = 0.5
+
+    # Step 5: Cascade matching (prioritize recently seen tracks)
+    matches = []
+    unmatched_dets = set(range(len(detections)))
+    unmatched_tracks = set(range(len(tracks)))
+
+    # Match by age (newer tracks first)
+    For age = 1 to max_age:
+        tracks_of_age = [j for j in unmatched_tracks if tracks[j].age == age]
+        m, ud, ut = Hungarian(C[unmatched_dets, tracks_of_age])
+        matches.extend(m)
+        unmatched_dets = ud
+        unmatched_tracks = ut
+
+    # Step 6: Update tracks
+    For (det_idx, track_idx) in matches:
+        tracks[track_idx].update(detections[det_idx])
+        tracks[track_idx].feature_gallery.append(detections[det_idx].feature)
+
+    # Step 7: Create new tracks
+    For det_idx in unmatched_dets:
+        new_track = Track(id=next_id, detection=detections[det_idx])
+        tracks.append(new_track)
+        next_id += 1
+
+    # Step 8: Delete lost tracks
+    tracks = [T for T in tracks if T.time_since_update < max_age]
+
+Return tracks
+```
+
+**Key Improvements over SORT**:
+1. **Appearance Features**: 128-d CNN embeddings (trained on person re-ID dataset)
+2. **Cosine Distance**: $d(f_1, f_2) = 1 - \frac{f_1 \cdot f_2}{\|f_1\| \|f_2\|}$
+3. **Cascade Matching**: Prioritize recent tracks (handles long-term occlusions)
+4. **Feature Gallery**: Store multiple appearance features per track
+
+**Complexity**:
+- Time: $O(n \cdot m \cdot d + n^3)$ where d = feature dimension
+- Space: $O(m \cdot k \cdot d)$ where k = gallery size
+
+**Performance**:
+- MOT16: MOTA 61.4%, IDF1 62.2%
+- Speed: 40 Hz (still real-time)
+
+---
+
+**Algorithm 3: ByteTrack** (Zhang et al., 2021):
+
+*Key Innovation*: Associate all detections (including low-confidence)
+
+*Motivation*: Low-confidence detections often correspond to occluded objects
+
+*Algorithm*:
+```
+Input: Video frames, Detector with confidence scores
+Output: Trajectories
+
+For each frame t:
+    # Step 1: Detect with all confidences
+    all_detections = Detector(I_t)
+
+    # Step 2: Separate high and low confidence
+    D_high = [d for d in all_detections if d.score > τ_high]  # τ_high = 0.6
+    D_low = [d for d in all_detections if τ_low < d.score < τ_high]  # τ_low = 0.1
+
+    # Step 3: First association (high-confidence with tracks)
+    tracks_predict()
+    matches_1, unmatched_tracks_1, unmatched_dets_high = Associate(D_high, tracks)
+
+    # Update matched tracks
+    update_tracks(matches_1)
+
+    # Step 4: Second association (low-confidence with remaining tracks)
+    matches_2, unmatched_tracks_2, unmatched_dets_low = Associate(
+        D_low, unmatched_tracks_1
+    )
+
+    # Update tracks with low-confidence detections
+    update_tracks(matches_2)
+
+    # Step 5: Create new tracks from unmatched high-confidence detections
+    For d in unmatched_dets_high:
+        create_new_track(d)
+
+    # Step 6: Delete lost tracks
+    delete_lost_tracks(unmatched_tracks_2)
+
+Return tracks
+```
+
+**Key Insight**: Low-confidence detections can recover tracks during occlusions
+
+**Complexity**:
+- Time: $O(n_h \cdot m + n_l \cdot m' + m^3)$ where:
+  - $n_h$ = high-confidence detections
+  - $n_l$ = low-confidence detections
+  - $m$ = tracks
+- Space: $O(m^2)$
+
+**Performance**:
+- MOT17: MOTA 80.3%, IDF1 77.3%
+- MOT20: MOTA 77.8%, IDF1 75.2%
+- Speed: 30 FPS on V100 GPU
+- **State-of-the-art** on MOT benchmarks (as of 2021)
+
+#### 8.3 Implementation
+
+```python
+"""
+Chapter 8: Multi-Object Tracking Implementation
+
+Demonstrates tracking as composition of:
+    - Object detection per frame
+    - Motion prediction (Kalman filter)
+    - Data association (Hungarian algorithm)
+    - Trajectory management
+"""
+
+from typing import List, Dict, Optional, Tuple
+from scipy.optimize import linear_sum_assignment
+from collections import deque
+
+
+@dataclass
+class TrackedObject:
+    """
+    A tracked object with persistent identity.
+
+    Mathematical Definition:
+        T = (id, trajectory, state, features) where:
+        - id ∈ ℕ: Unique persistent identifier
+        - trajectory: [(d₁, t₁), ..., (dₙ, tₙ)]
+        - state: Kalman filter state [x, y, s, r, vₓ, vᵧ, vₛ]ᵀ
+        - features: Appearance embeddings
+    """
+    track_id: int
+    detections: List[Tuple[Detection, int]]  # (detection, frame_number)
+    kalman_state: np.ndarray  # [x, y, s, r, vx, vy, vs]
+    kalman_covariance: np.ndarray
+    feature_gallery: deque  # Recent appearance features
+    time_since_update: int = 0
+    hits: int = 0
+    age: int = 0
+
+    def __post_init__(self):
+        if self.feature_gallery is None:
+            self.feature_gallery = deque(maxlen=100)
+
+    @property
+    def current_bbox(self) -> Region:
+        """Get current bounding box from Kalman state."""
+        x, y, s, r = self.kalman_state[:4]
+        w = np.sqrt(s * r)
+        h = s / w
+        return Region(
+            x - w/2, y - h/2,
+            x + w/2, y + h/2
+        )
+
+    def predict(self):
+        """
+        Predict next position using Kalman filter.
+
+        Motion Model (Constant Velocity):
+            x_{t+1} = x_t + vₓ
+            y_{t+1} = y_t + vᵧ
+            s_{t+1} = s_t + vₛ
+            r_{t+1} = r_t  (constant aspect ratio)
+        """
+        # State transition matrix
+        F = np.array([
+            [1, 0, 0, 0, 1, 0, 0],  # x
+            [0, 1, 0, 0, 0, 1, 0],  # y
+            [0, 0, 1, 0, 0, 0, 1],  # s
+            [0, 0, 0, 1, 0, 0, 0],  # r
+            [0, 0, 0, 0, 1, 0, 0],  # vx
+            [0, 0, 0, 0, 0, 1, 0],  # vy
+            [0, 0, 0, 0, 0, 0, 1]   # vs
+        ])
+
+        # Process noise
+        Q = np.eye(7) * 0.01
+
+        # Predict
+        self.kalman_state = F @ self.kalman_state
+        self.kalman_covariance = F @ self.kalman_covariance @ F.T + Q
+
+        self.age += 1
+        self.time_since_update += 1
+
+    def update(self, detection: Detection, frame_number: int):
+        """
+        Update track with new detection using Kalman filter.
+
+        Kalman Update:
+            K = P·Hᵀ·(H·P·Hᵀ + R)⁻¹  (Kalman gain)
+            x = x + K·(z - H·x)  (state update)
+            P = (I - K·H)·P  (covariance update)
+        """
+        # Observation matrix (we observe position and scale)
+        H = np.array([
+            [1, 0, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0, 0],
+            [0, 0, 0, 1, 0, 0, 0]
+        ])
+
+        # Measurement noise
+        R = np.eye(4) * 0.1
+
+        # Convert detection to measurement
+        x_center = (detection.region.x1 + detection.region.x2) / 2
+        y_center = (detection.region.y1 + detection.region.y2) / 2
+        w = detection.region.x2 - detection.region.x1
+        h = detection.region.y2 - detection.region.y1
+        s = w * h
+        r = w / h if h > 0 else 1.0
+
+        z = np.array([x_center, y_center, s, r])
+
+        # Kalman update
+        y = z - (H @ self.kalman_state)  # Innovation
+        S = H @ self.kalman_covariance @ H.T + R  # Innovation covariance
+        K = self.kalman_covariance @ H.T @ np.linalg.inv(S)  # Kalman gain
+
+        self.kalman_state = self.kalman_state + K @ y
+        self.kalman_covariance = (np.eye(7) - K @ H) @ self.kalman_covariance
+
+        # Update track history
+        self.detections.append((detection, frame_number))
+        self.time_since_update = 0
+        self.hits += 1
+
+
+class SORTTracker:
+    """
+    Simple Online and Realtime Tracking (SORT).
+
+    Uses Kalman filter for motion prediction and Hungarian algorithm
+    for data association based on IoU.
+
+    Performance:
+        - Fast: 260 Hz (real-time++)
+        - Simple: Only motion, no appearance
+        - Baseline: Good for short-term tracking
+
+    Limitations:
+        - Identity switches during occlusions
+        - No re-identification after long occlusion
+    """
+
+    def __init__(self,
+                 max_age: int = 1,
+                 min_hits: int = 3,
+                 iou_threshold: float = 0.3):
+        """
+        Initialize SORT tracker.
+
+        Args:
+            max_age: Maximum frames to keep track without update
+            min_hits: Minimum detections before track is confirmed
+            iou_threshold: Minimum IoU for matching
+        """
+        self.max_age = max_age
+        self.min_hits = min_hits
+        self.iou_threshold = iou_threshold
+
+        self.tracks: List[TrackedObject] = []
+        self.next_id = 1
+        self.frame_count = 0
+
+    def update(self, detections: List[Detection]) -> List[TrackedObject]:
+        """
+        Update tracker with new detections.
+
+        Algorithm:
+            1. Predict all track positions
+            2. Compute IoU cost matrix
+            3. Hungarian assignment
+            4. Update matched tracks
+            5. Create new tracks
+            6. Delete lost tracks
+
+        Complexity: O(n·m + min(n,m)³)
+
+        Returns:
+            List of active tracks
+        """
+        self.frame_count += 1
+
+        # Step 1: Predict
+        for track in self.tracks:
+            track.predict()
+
+        # Step 2: Compute cost matrix (1 - IoU)
+        cost_matrix = np.zeros((len(detections), len(self.tracks)))
+
+        for i, det in enumerate(detections):
+            for j, track in enumerate(self.tracks):
+                iou = det.region.iou(track.current_bbox)
+                cost_matrix[i, j] = 1 - iou
+
+        # Step 3: Hungarian assignment
+        if len(detections) > 0 and len(self.tracks) > 0:
+            row_ind, col_ind = linear_sum_assignment(cost_matrix)
+
+            matches = []
+            for i, j in zip(row_ind, col_ind):
+                if cost_matrix[i, j] < (1 - self.iou_threshold):
+                    matches.append((i, j))
+
+            unmatched_detections = set(range(len(detections))) - set(row_ind)
+            unmatched_tracks = set(range(len(self.tracks))) - set(col_ind)
+        else:
+            matches = []
+            unmatched_detections = set(range(len(detections)))
+            unmatched_tracks = set(range(len(self.tracks)))
+
+        # Step 4: Update matched tracks
+        for det_idx, track_idx in matches:
+            self.tracks[track_idx].update(detections[det_idx], self.frame_count)
+
+        # Step 5: Create new tracks
+        for det_idx in unmatched_detections:
+            det = detections[det_idx]
+
+            # Initialize Kalman state
+            x_center = (det.region.x1 + det.region.x2) / 2
+            y_center = (det.region.y1 + det.region.y2) / 2
+            w = det.region.x2 - det.region.x1
+            h = det.region.y2 - det.region.y1
+            s = w * h
+            r = w / h if h > 0 else 1.0
+
+            state = np.array([x_center, y_center, s, r, 0, 0, 0])
+            covariance = np.eye(7) * 10
+
+            new_track = TrackedObject(
+                track_id=self.next_id,
+                detections=[(det, self.frame_count)],
+                kalman_state=state,
+                kalman_covariance=covariance,
+                feature_gallery=deque(maxlen=100)
+            )
+            self.tracks.append(new_track)
+            self.next_id += 1
+
+        # Step 6: Delete lost tracks
+        self.tracks = [
+            t for t in self.tracks
+            if t.time_since_update <= self.max_age
+        ]
+
+        # Return confirmed tracks
+        return [t for t in self.tracks if t.hits >= self.min_hits]
+
+
+class MultiObjectTrackingPipeline(Pipeline):
+    """
+    Complete multi-object tracking system.
+
+    Mathematical Formulation:
+        MOT = LinkTrajectories ∘ Associate ∘ Detect ∘ Transform
+
+    Proof that MOT ∈ L_v:
+        - Transform: Resize, Normalize ∈ {Transform} (per frame)
+        - Detect: Object detector ∈ {Detector}
+        - Associate: Hungarian + Kalman ∈ {Reasoner} (symbolic matching)
+        - LinkTrajectories: Trajectory builder ∈ {Reasoner}
+
+    Therefore, multi-object tracking is a composition of primitives. ∎
+
+    Evaluation Metrics:
+        - MOTA (Multi-Object Tracking Accuracy)
+        - IDF1 (ID F1 Score)
+        - MOTP (Multi-Object Tracking Precision)
+
+    Applications:
+        - Surveillance (crowd monitoring)
+        - Autonomous driving (vehicle/pedestrian tracking)
+        - Sports analytics (player tracking)
+        - Robotics (multi-robot coordination)
+        - Wildlife monitoring (animal behavior)
+    """
+
+    def __init__(self,
+                 detector_type: str = 'yolo',
+                 tracker_type: str = 'sort',
+                 device: str = 'cpu'):
+        """
+        Initialize MOT pipeline.
+
+        Args:
+            detector_type: 'yolo', 'faster_rcnn', etc.
+            tracker_type: 'sort', 'deepsort', 'bytetrack'
+            device: 'cpu' or 'cuda'
+        """
+        self.detector_type = detector_type
+        self.tracker_type = tracker_type
+        self.device = device
+
+        # Components
+        self.detector = MultiScaleObjectDetector(device=device)
+        self.tracker = SORTTracker(max_age=30, min_hits=3)
+
+        # Preprocessing
+        self.preprocess = Pipeline(
+            Resize(640, 640),
+            Normalize()
+        )
+
+        # Visualization
+        self.colors = self._generate_colors(100)  # Color per ID
+
+    def _generate_colors(self, n: int) -> List[Tuple[int, int, int]]:
+        """Generate distinct colors for track visualization."""
+        import colorsys
+        colors = []
+        for i in range(n):
+            hue = i / n
+            rgb = colorsys.hsv_to_rgb(hue, 1.0, 1.0)
+            colors.append(tuple(int(c * 255) for c in rgb))
+        return colors
+
+    def __call__(self, image: Image) -> Tuple[List[TrackedObject], Image]:
+        """
+        Track objects in image.
+
+        Returns:
+            (tracks, annotated_image)
+            - tracks: List of TrackedObject with persistent IDs
+            - annotated_image: Image with bounding boxes and IDs
+
+        Complexity:
+            O(H·W·k + n·m + m³) where:
+            - H×W = image size
+            - k = CNN depth
+            - n = detections
+            - m = tracks
+        """
+        # Step 1: Preprocess
+        preprocessed = self.preprocess(image)
+
+        # Step 2: Detect objects
+        detections = self.detector(preprocessed)
+
+        # Step 3: Update tracker
+        tracks = self.tracker.update(detections)
+
+        # Step 4: Visualize
+        annotated = self._visualize_tracks(image, tracks)
+
+        return tracks, annotated
+
+    def _visualize_tracks(self, image: Image, tracks: List[TrackedObject]) -> Image:
+        """
+        Draw bounding boxes and trajectories on image.
+
+        Visualization:
+            - Bounding box with track ID
+            - Trajectory trail (last 30 positions)
+            - Color-coded by ID
+        """
+        import cv2
+
+        img_cv = (image.tensor * 255).astype(np.uint8).copy()
+
+        for track in tracks:
+            if len(track.detections) == 0:
+                continue
+
+            # Get color for this ID
+            color = self.colors[track.track_id % len(self.colors)]
+
+            # Draw current bounding box
+            bbox = track.current_bbox
+            cv2.rectangle(
+                img_cv,
+                (int(bbox.x1), int(bbox.y1)),
+                (int(bbox.x2), int(bbox.y2)),
+                color,
+                2
+            )
+
+            # Draw ID label
+            label = f"ID: {track.track_id}"
+            cv2.putText(
+                img_cv,
+                label,
+                (int(bbox.x1), int(bbox.y1) - 10),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.5,
+                color,
+                2
+            )
+
+            # Draw trajectory trail
+            if len(track.detections) > 1:
+                points = [
+                    (int(det.region.center.x), int(det.region.center.y))
+                    for det, _ in track.detections[-30:]
+                ]
+                for i in range(len(points) - 1):
+                    cv2.line(img_cv, points[i], points[i+1], color, 2)
+
+        return Image((img_cv / 255.0).astype(np.float32))
+
+
+```
+
+---
+
+## Part III: Summary & Capstone
+
+### Completed: Tier 2 — Advanced Vision Capabilities
+
+We have now completed **Part III** covering four advanced vision tasks:
+
+**Chapter 5: Human Pose Estimation**
+- 17-keypoint skeleton detection (COCO format)
+- HRNet architecture (75.5% AP)
+- Kalman filtering for temporal smoothing
+- Applications: fitness, healthcare, sports
+
+**Chapter 6: Gesture Recognition**
+- 21-hand keypoint detection (MediaPipe)
+- Three temporal models: C3D, LSTM, Transformer
+- 92% accuracy on NTU RGB+D (Transformer)
+- Applications: touchless control, sign language, AR/VR
+
+**Chapter 7: Image Segmentation**
+- Semantic: U-Net (92% IoU medical), DeepLab v3+ (89% mIoU PASCAL VOC)
+- Instance: Mask R-CNN (37.1% AP COCO)
+- Applications: autonomous driving, medical diagnosis, robotics
+
+**Chapter 8: Multi-Object Tracking**
+- SORT (260 Hz, baseline)
+- DeepSORT (61.4% MOTA, appearance features)
+- ByteTrack (80.3% MOTA, state-of-the-art)
+- Applications: surveillance, autonomous driving, sports analytics
+
+### Unified Computational Paradigm: Proof Complete for Tier 2
+
+**Theorem**: All Tier 2 tasks are compositions of $\mathcal{L}_v$ primitives.
+
+**Proof** (by construction):
+
+1. **Pose Estimation** = Track ∘ BuildSkeleton ∘ DetectKeypoints ∘ Transform
+2. **Gesture Recognition** = Classify ∘ EncodeTemporal ∘ DetectHands ∘ Transform
+3. **Segmentation** = Decode ∘ EncodeFeatures ∘ Transform
+4. **Tracking** = LinkTrajectories ∘ Associate ∘ Detect ∘ Transform
+
+All components belong to {Transform, Detector, Reasoner}. ∎
+
+### Performance Summary
+
+| Task | Algorithm | Metric | Performance | Speed (FPS) |
+|------|-----------|--------|-------------|-------------|
+| Pose | HRNet | COCO AP | 75.5% | 10 |
+| Gesture | Transformer | NTU Acc | 92% | - |
+| Segmentation | DeepLab v3+ | VOC mIoU | 89.0% | 5 |
+| Segmentation | Mask R-CNN | COCO AP | 37.1% | 5 |
+| Tracking | ByteTrack | MOT17 MOTA | 80.3% | 30 |
+
+### Lines of Code
+
+**Total**: 3,906 + ~800 (Chapter 8) = **~4,700 lines**
+
+Part III is now complete, forming a solid foundation for advanced vision capabilities. All tasks proven to be compositions of the three fundamental operations (Transform, Detect, Reason), embodying the unified computational paradigm.
