@@ -39,8 +39,8 @@ def simple_model():
 
 @pytest.fixture
 def test_tensor():
-    """Test image tensor."""
-    return torch.randn(1, 3, 224, 224)
+    """Test image tensor in [0, 1] range for adversarial testing."""
+    return torch.rand(1, 3, 224, 224)
 
 
 @pytest.fixture
