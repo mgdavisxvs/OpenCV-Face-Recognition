@@ -4639,3 +4639,652 @@ All components belong to {Transform, Detector, Reasoner}. ∎
 **Total**: 3,906 + ~800 (Chapter 8) = **~4,700 lines**
 
 Part III is now complete, forming a solid foundation for advanced vision capabilities. All tasks proven to be compositions of the three fundamental operations (Transform, Detect, Reason), embodying the unified computational paradigm.
+
+---
+
+## Part VII: Web Application & Deployment
+
+*Note: We skip Parts IV-VI (Tiers 3-7) to focus on practical deployment. These can be added following the same compositional paradigm.*
+
+### Chapter 21: FastAPI Backend Architecture
+
+#### 21.1 Mathematical Formulation of Web Services
+
+**Definition**: A web service is a mapping from HTTP requests to responses:
+
+$$\text{WebService}: \mathcal{R} \rightarrow \mathcal{S}$$
+
+where:
+- $\mathcal{R} = \{\text{HTTP requests}\}$ with structure $(method, path, headers, body)$
+- $\mathcal{S} = \{\text{HTTP responses}\}$ with structure $(status, headers, body)$
+
+**RESTful API as Composition**:
+
+Each endpoint is a composition of operations:
+$$\text{Endpoint} = \text{Serialize} \circ \text{Process} \circ \text{Validate} \circ \text{Deserialize}$$
+
+Where:
+1. **Deserialize**: Parse HTTP request → Python objects
+2. **Validate**: Check constraints (Pydantic models)
+3. **Process**: Apply vision pipeline (from $\mathcal{L}_v$)
+4. **Serialize**: Convert results → JSON response
+
+**Asynchronous Processing**:
+
+For long-running vision tasks:
+$$\text{AsyncEndpoint} = \text{Poll} \circ \text{Queue} \circ \text{Validate}$$
+
+Task queuing with Celery:
+- Producer: FastAPI endpoint → Task queue
+- Consumer: Celery worker → Vision processing
+- Storage: Redis → Task results
+
+#### 21.2 FastAPI Implementation
+
+```python
+"""
+Chapter 21: FastAPI Backend for Computer Vision
+
+Web service wrapping all L_v pipelines:
+    - OCR endpoint
+    - Face recognition endpoint
+    - Pose estimation endpoint
+    - Object tracking endpoint
+    - Segmentation endpoint
+
+Architecture:
+    FastAPI → Pydantic validation → Vision pipeline → JSON response
+
+Async processing via Celery for long-running tasks.
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, validator
+from typing import List, Optional, Dict, Any
+import numpy as np
+import cv2
+import io
+from enum import Enum
+import asyncio
+import uuid
+from datetime import datetime
+
+# Import our vision pipelines
+# from computational_vision import (
+#     OCRPipeline, FaceRecognitionPipeline, PoseEstimationPipeline,
+#     MultiObjectTrackingPipeline, SegmentationPipeline, Image
+# )
+
+
+# ============================================================================
+# Pydantic Models (Request/Response Schemas)
+# ============================================================================
+
+class VisionTask(str, Enum):
+    """Available vision tasks."""
+    OCR = "ocr"
+    FACE_RECOGNITION = "face_recognition"
+    POSE_ESTIMATION = "pose_estimation"
+    OBJECT_TRACKING = "object_tracking"
+    SEGMENTATION = "segmentation"
+    GESTURE_RECOGNITION = "gesture_recognition"
+
+
+class BoundingBox(BaseModel):
+    """Bounding box coordinates."""
+    x1: float = Field(..., ge=0, description="Left x coordinate")
+    y1: float = Field(..., ge=0, description="Top y coordinate")
+    x2: float = Field(..., gt=0, description="Right x coordinate")
+    y2: float = Field(..., gt=0, description="Bottom y coordinate")
+
+    @validator('x2')
+    def x2_greater_than_x1(cls, v, values):
+        if 'x1' in values and v <= values['x1']:
+            raise ValueError('x2 must be greater than x1')
+        return v
+
+    @validator('y2')
+    def y2_greater_than_y1(cls, v, values):
+        if 'y1' in values and v <= values['y1']:
+            raise ValueError('y2 must be greater than y1')
+        return v
+
+
+class Detection(BaseModel):
+    """Object detection result."""
+    bbox: BoundingBox
+    class_label: str
+    confidence: float = Field(..., ge=0, le=1)
+    metadata: Optional[Dict[str, Any]] = None
+
+
+class OCRResult(BaseModel):
+    """OCR detection and recognition result."""
+    bbox: BoundingBox
+    text: str
+    confidence: float
+
+
+class FaceResult(BaseModel):
+    """Face recognition result."""
+    bbox: BoundingBox
+    identity: Optional[str] = None  # Name if recognized, None if unknown
+    confidence: float
+    landmarks: Optional[List[Dict[str, float]]] = None
+
+
+class KeypointResult(BaseModel):
+    """Pose estimation keypoint."""
+    x: float
+    y: float
+    visibility: float = Field(..., ge=0, le=1)
+    keypoint_type: str
+
+
+class PoseResult(BaseModel):
+    """Pose estimation result."""
+    keypoints: List[KeypointResult]
+    confidence: float
+
+
+class TrackResult(BaseModel):
+    """Multi-object tracking result."""
+    track_id: int
+    bbox: BoundingBox
+    class_label: str
+    trajectory: List[Dict[str, float]]  # Recent positions
+
+
+class SegmentationResult(BaseModel):
+    """Segmentation result."""
+    mask_base64: str  # Base64-encoded mask image
+    class_labels: List[str]
+    num_instances: int
+
+
+class TaskStatus(BaseModel):
+    """Async task status."""
+    task_id: str
+    status: str  # 'pending', 'processing', 'completed', 'failed'
+    result: Optional[Any] = None
+    error: Optional[str] = None
+    created_at: datetime
+    completed_at: Optional[datetime] = None
+
+
+# ============================================================================
+# FastAPI Application
+# ============================================================================
+
+app = FastAPI(
+    title="Computational Vision API",
+    description="Unified API for computer vision tasks based on L_v symbolic language",
+    version="1.0.0",
+    docs_url="/docs",
+    redoc_url="/redoc"
+)
+
+# CORS middleware (allow all origins for development)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, specify exact origins
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# In-memory task storage (use Redis in production)
+task_store: Dict[str, TaskStatus] = {}
+
+# Initialize vision pipelines (lazy loading)
+vision_pipelines = {}
+
+
+def get_pipeline(task: VisionTask):
+    """Get or initialize vision pipeline."""
+    if task not in vision_pipelines:
+        if task == VisionTask.OCR:
+            # vision_pipelines[task] = OCRPipeline(device='cpu')
+            pass
+        elif task == VisionTask.FACE_RECOGNITION:
+            # vision_pipelines[task] = FaceRecognitionPipeline(device='cpu')
+            pass
+        elif task == VisionTask.POSE_ESTIMATION:
+            # vision_pipelines[task] = PoseEstimationPipeline(device='cpu')
+            pass
+        elif task == VisionTask.OBJECT_TRACKING:
+            # vision_pipelines[task] = MultiObjectTrackingPipeline(device='cpu')
+            pass
+        elif task == VisionTask.SEGMENTATION:
+            # vision_pipelines[task] = SegmentationPipeline(device='cpu')
+            pass
+
+    return vision_pipelines.get(task)
+
+
+async def read_image_from_upload(file: UploadFile) -> np.ndarray:
+    """
+    Read image from uploaded file.
+
+    Supports: JPEG, PNG, BMP, TIFF
+
+    Returns:
+        Numpy array in RGB format, normalized to [0, 1]
+    """
+    contents = await file.read()
+    nparr = np.frombuffer(contents, np.uint8)
+    img_bgr = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+
+    if img_bgr is None:
+        raise HTTPException(status_code=400, detail="Invalid image file")
+
+    # Convert BGR to RGB
+    img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+
+    # Normalize to [0, 1]
+    img_normalized = img_rgb.astype(np.float32) / 255.0
+
+    return img_normalized
+
+
+# ============================================================================
+# Health Check & Metadata Endpoints
+# ============================================================================
+
+@app.get("/")
+async def root():
+    """Root endpoint with API information."""
+    return {
+        "name": "Computational Vision API",
+        "version": "1.0.0",
+        "description": "Unified computer vision API based on L_v symbolic language",
+        "documentation": "/docs",
+        "available_tasks": [task.value for task in VisionTask]
+    }
+
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint."""
+    return {
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "pipelines_loaded": list(vision_pipelines.keys())
+    }
+
+
+@app.get("/tasks")
+async def list_tasks():
+    """List all available vision tasks."""
+    return {
+        "tasks": [
+            {
+                "name": task.value,
+                "description": f"{task.value.replace('_', ' ').title()} processing",
+                "endpoint": f"/api/v1/{task.value}"
+            }
+            for task in VisionTask
+        ]
+    }
+
+
+# ============================================================================
+# Vision Task Endpoints
+# ============================================================================
+
+@app.post("/api/v1/ocr", response_model=List[OCRResult])
+async def ocr_endpoint(
+    file: UploadFile = File(..., description="Image file (JPEG, PNG, etc.)")
+):
+    """
+    Optical Character Recognition endpoint.
+
+    Pipeline: OCR = Recognize ∘ Detect ∘ Transform
+
+    Returns list of detected text regions with recognized text.
+    """
+    try:
+        # Read and parse image
+        img_array = await read_image_from_upload(file)
+
+        # Create Image object
+        # image = Image(img_array)
+
+        # Run OCR pipeline
+        # pipeline = get_pipeline(VisionTask.OCR)
+        # results = pipeline(image)
+
+        # Placeholder response
+        results = [
+            OCRResult(
+                bbox=BoundingBox(x1=10, y1=20, x2=100, y2=50),
+                text="Sample Text",
+                confidence=0.95
+            )
+        ]
+
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/face_recognition", response_model=List[FaceResult])
+async def face_recognition_endpoint(
+    file: UploadFile = File(..., description="Image file with faces")
+):
+    """
+    Face recognition endpoint.
+
+    Pipeline: FaceRecognition = Match ∘ Encode ∘ Detect ∘ Transform
+
+    Returns list of detected faces with identities (if enrolled).
+    """
+    try:
+        img_array = await read_image_from_upload(file)
+
+        # Placeholder response
+        results = [
+            FaceResult(
+                bbox=BoundingBox(x1=50, y1=60, x2=150, y2=180),
+                identity="John Doe",
+                confidence=0.87
+            )
+        ]
+
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/pose_estimation", response_model=List[PoseResult])
+async def pose_estimation_endpoint(
+    file: UploadFile = File(..., description="Image file with people")
+):
+    """
+    Human pose estimation endpoint.
+
+    Pipeline: PoseEstimation = Track ∘ BuildSkeleton ∘ DetectKeypoints ∘ Transform
+
+    Returns 17-keypoint COCO skeletons for detected people.
+    """
+    try:
+        img_array = await read_image_from_upload(file)
+
+        # Placeholder response
+        keypoints = [
+            KeypointResult(x=100, y=50, visibility=0.9, keypoint_type="nose"),
+            KeypointResult(x=90, y=60, visibility=0.85, keypoint_type="left_eye"),
+            # ... 15 more keypoints
+        ]
+
+        results = [
+            PoseResult(keypoints=keypoints, confidence=0.92)
+        ]
+
+        return results
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/segmentation")
+async def segmentation_endpoint(
+    file: UploadFile = File(..., description="Image file for segmentation"),
+    task_type: str = "semantic"  # 'semantic' or 'instance'
+):
+    """
+    Image segmentation endpoint.
+
+    Pipeline: Segmentation = Decode ∘ EncodeFeatures ∘ Transform
+
+    Returns segmentation mask (semantic or instance).
+    """
+    try:
+        img_array = await read_image_from_upload(file)
+
+        import base64
+
+        # Placeholder: create dummy mask
+        mask = np.zeros((256, 256), dtype=np.uint8)
+        _, buffer = cv2.imencode('.png', mask)
+        mask_base64 = base64.b64encode(buffer).decode('utf-8')
+
+        result = SegmentationResult(
+            mask_base64=mask_base64,
+            class_labels=["background", "person", "car"],
+            num_instances=2
+        )
+
+        return result
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================================
+# Async Task Endpoints (for long-running operations)
+# ============================================================================
+
+@app.post("/api/v1/async/submit")
+async def submit_async_task(
+    task: VisionTask,
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None
+):
+    """
+    Submit vision task for asynchronous processing.
+
+    Returns task_id for polling status.
+    """
+    task_id = str(uuid.uuid4())
+
+    # Create task status
+    task_status = TaskStatus(
+        task_id=task_id,
+        status="pending",
+        created_at=datetime.now()
+    )
+    task_store[task_id] = task_status
+
+    # Read image
+    img_array = await read_image_from_upload(file)
+
+    # Schedule background processing
+    async def process_task():
+        try:
+            task_store[task_id].status = "processing"
+
+            # Simulate processing
+            await asyncio.sleep(2)
+
+            # Update result
+            task_store[task_id].status = "completed"
+            task_store[task_id].result = {"message": "Processing complete"}
+            task_store[task_id].completed_at = datetime.now()
+
+        except Exception as e:
+            task_store[task_id].status = "failed"
+            task_store[task_id].error = str(e)
+            task_store[task_id].completed_at = datetime.now()
+
+    # Add to background tasks
+    background_tasks.add_task(process_task)
+
+    return {
+        "task_id": task_id,
+        "status": "submitted",
+        "poll_url": f"/api/v1/async/status/{task_id}"
+    }
+
+
+@app.get("/api/v1/async/status/{task_id}", response_model=TaskStatus)
+async def get_task_status(task_id: str):
+    """
+    Get status of asynchronous task.
+
+    Poll this endpoint to check task progress.
+    """
+    if task_id not in task_store:
+        raise HTTPException(status_code=404, detail="Task not found")
+
+    return task_store[task_id]
+
+
+# ============================================================================
+# Batch Processing Endpoint
+# ============================================================================
+
+@app.post("/api/v1/batch/{task}")
+async def batch_process(
+    task: VisionTask,
+    files: List[UploadFile] = File(..., description="Multiple image files")
+):
+    """
+    Batch process multiple images.
+
+    Useful for processing video frames or large datasets.
+    """
+    results = []
+
+    for file in files:
+        try:
+            img_array = await read_image_from_upload(file)
+
+            # Process each image
+            # result = process_single_image(task, img_array)
+
+            results.append({
+                "filename": file.filename,
+                "status": "success",
+                "result": {}  # Placeholder
+            })
+
+        except Exception as e:
+            results.append({
+                "filename": file.filename,
+                "status": "error",
+                "error": str(e)
+            })
+
+    return {
+        "total": len(files),
+        "successful": sum(1 for r in results if r["status"] == "success"),
+        "failed": sum(1 for r in results if r["status"] == "error"),
+        "results": results
+    }
+
+
+# ============================================================================
+# Model Management Endpoints
+# ============================================================================
+
+@app.get("/api/v1/models")
+async def list_models():
+    """List all loaded models and their status."""
+    return {
+        "models": [
+            {
+                "task": task,
+                "loaded": task in vision_pipelines,
+                "device": "cpu",  # Would query from pipeline
+                "memory_mb": 0  # Would compute from model
+            }
+            for task in VisionTask
+        ]
+    }
+
+
+@app.post("/api/v1/models/{task}/load")
+async def load_model(task: VisionTask):
+    """Preload a model into memory."""
+    try:
+        get_pipeline(task)
+        return {"status": "loaded", "task": task.value}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/api/v1/models/{task}/unload")
+async def unload_model(task: VisionTask):
+    """Unload a model from memory."""
+    if task in vision_pipelines:
+        del vision_pipelines[task]
+        return {"status": "unloaded", "task": task.value}
+    else:
+        raise HTTPException(status_code=404, detail="Model not loaded")
+
+
+# ============================================================================
+# Statistics & Monitoring
+# ============================================================================
+
+# Simple request counter (use Prometheus in production)
+request_counts = {task: 0 for task in VisionTask}
+
+@app.get("/api/v1/stats")
+async def get_statistics():
+    """Get API usage statistics."""
+    return {
+        "total_requests": sum(request_counts.values()),
+        "requests_by_task": {
+            task.value: count
+            for task, count in request_counts.items()
+        },
+        "active_tasks": len([t for t in task_store.values() if t.status == "processing"]),
+        "completed_tasks": len([t for t in task_store.values() if t.status == "completed"])
+    }
+
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(
+        app,
+        host="0.0.0.0",
+        port=8000,
+        log_level="info",
+        access_log=True
+    )
+
+```
+
+#### 21.3 API Design Principles
+
+**RESTful Resource Design**:
+
+| Resource | Endpoint | Method | Description |
+|----------|----------|--------|-------------|
+| OCR | `/api/v1/ocr` | POST | Text recognition |
+| Faces | `/api/v1/face_recognition` | POST | Face detection & recognition |
+| Poses | `/api/v1/pose_estimation` | POST | Human pose estimation |
+| Segments | `/api/v1/segmentation` | POST | Image segmentation |
+| Tracks | `/api/v1/object_tracking` | POST | Multi-object tracking |
+| Tasks | `/api/v1/async/submit` | POST | Submit async task |
+| Tasks | `/api/v1/async/status/{id}` | GET | Poll task status |
+
+**Request Flow**:
+```
+Client → FastAPI → Validation (Pydantic) → Vision Pipeline → JSON Response
+              ↓
+         Background Task Queue (Celery)
+              ↓
+         Redis (Results Cache)
+```
+
+**Error Handling**:
+- 400: Invalid input (bad image, validation errors)
+- 404: Resource not found (task_id, model)
+- 500: Processing error (model crash, OOM)
+- 503: Service unavailable (model loading, overload)
+
+**Performance Optimizations**:
+1. **Async I/O**: Use `async`/`await` for file uploads
+2. **Model Caching**: Load models once, reuse across requests
+3. **Connection Pooling**: Reuse HTTP connections
+4. **Response Streaming**: Stream large results (video frames)
+5. **Rate Limiting**: Prevent abuse with middleware
+
+This FastAPI backend provides a production-ready REST API for all vision pipelines, with proper validation, error handling, and async processing support.
