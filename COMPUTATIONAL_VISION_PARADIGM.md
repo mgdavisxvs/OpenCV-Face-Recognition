@@ -5288,3 +5288,1012 @@ Client → FastAPI → Validation (Pydantic) → Vision Pipeline → JSON Respon
 5. **Rate Limiting**: Prevent abuse with middleware
 
 This FastAPI backend provides a production-ready REST API for all vision pipelines, with proper validation, error handling, and async processing support.
+
+---
+
+### Chapter 22: React Frontend with TailwindCSS
+
+**Objective**: Build a modern, responsive web interface for interacting with the computational vision API.
+
+#### 22.1 Mathematical Formulation of UI Composition
+
+**Definition**: User Interface as State Transition System
+
+A user interface is a state machine `U: S × E → S × V` where:
+- `S` is the set of application states
+- `E` is the set of user events (clicks, uploads, etc.)
+- `V` is the set of visual representations (rendered DOM)
+
+**Compositional UI Architecture**:
+```
+UI = Render ∘ Compute ∘ Handle
+
+Where:
+- Handle: E → S' (event handlers update state)
+- Compute: S → S' (derived state computation)
+- Render: S → V (state to visual representation)
+```
+
+**React Component as Pure Function**:
+```
+Component: Props × State → VirtualDOM
+
+Where VirtualDOM = Tree(Element, {children, attributes})
+```
+
+**Proof that UI ∈ L_v (Compositional)**:
+
+A React component tree is a composition:
+```
+App = Layout ∘ (Header ⊕ Main ⊕ Footer)
+Main = Router ∘ (Upload ⊕ Results ⊕ History)
+
+Where ⊕ denotes parallel composition (children rendering)
+```
+
+This follows the associative composition law:
+```
+(A ∘ B) ∘ C = A ∘ (B ∘ C)
+```
+
+#### 22.2 React Component Architecture
+
+**Implementation**:
+
+```typescript
+// src/types.ts
+export interface BoundingBox {
+  x1: number;
+  y1: number;
+  x2: number;
+  y2: number;
+}
+
+export interface OCRResult {
+  bbox: BoundingBox;
+  text: string;
+  confidence: number;
+}
+
+export interface FaceResult {
+  bbox: BoundingBox;
+  identity: string | null;
+  confidence: number;
+  landmarks: Array<{x: number; y: number}>;
+}
+
+export interface PoseResult {
+  skeleton: Array<{
+    keypoint: string;
+    x: number;
+    y: number;
+    confidence: number;
+  }>;
+  bbox: BoundingBox;
+}
+
+export interface SegmentationResult {
+  mask: string;  // Base64 encoded PNG
+  classes: string[];
+  num_objects: number;
+}
+
+export type VisionTask = 'ocr' | 'face_recognition' | 'pose_estimation' | 'segmentation' | 'object_tracking';
+
+export interface TaskStatus {
+  task_id: string;
+  status: 'pending' | 'processing' | 'completed' | 'failed';
+  result?: any;
+  error?: string;
+  created_at: string;
+  completed_at?: string;
+}
+
+// src/components/ImageUpload.tsx
+import React, { useCallback, useState } from 'react';
+import { useDropzone } from 'react-dropzone';
+
+interface ImageUploadProps {
+  onImageUpload: (file: File, preview: string) => void;
+}
+
+export const ImageUpload: React.FC<ImageUploadProps> = ({ onImageUpload }) => {
+  const [preview, setPreview] = useState<string | null>(null);
+
+  const onDrop = useCallback((acceptedFiles: File[]) => {
+    const file = acceptedFiles[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataURL = reader.result as string;
+        setPreview(dataURL);
+        onImageUpload(file, dataURL);
+      };
+      reader.readAsDataURL(file);
+    }
+  }, [onImageUpload]);
+
+  const { getRootProps, getInputProps, isDragActive } = useDropzone({
+    onDrop,
+    accept: {
+      'image/*': ['.png', '.jpg', '.jpeg', '.webp']
+    },
+    maxFiles: 1
+  });
+
+  return (
+    <div className="w-full max-w-2xl mx-auto">
+      <div
+        {...getRootProps()}
+        className={`
+          border-2 border-dashed rounded-lg p-12 text-center cursor-pointer
+          transition-colors duration-200
+          ${isDragActive
+            ? 'border-blue-500 bg-blue-50'
+            : 'border-gray-300 hover:border-gray-400 bg-white'
+          }
+        `}
+      >
+        <input {...getInputProps()} />
+
+        {preview ? (
+          <div className="space-y-4">
+            <img
+              src={preview}
+              alt="Preview"
+              className="max-h-64 mx-auto rounded-lg shadow-md"
+            />
+            <p className="text-sm text-gray-600">
+              Drop a new image to replace, or click to select
+            </p>
+          </div>
+        ) : (
+          <div className="space-y-4">
+            <svg
+              className="mx-auto h-12 w-12 text-gray-400"
+              stroke="currentColor"
+              fill="none"
+              viewBox="0 0 48 48"
+            >
+              <path
+                d="M28 8H12a4 4 0 00-4 4v20m32-12v8m0 0v8a4 4 0 01-4 4H12a4 4 0 01-4-4v-4m32-4l-3.172-3.172a4 4 0 00-5.656 0L28 28M8 32l9.172-9.172a4 4 0 015.656 0L28 28m0 0l4 4m4-24h8m-4-4v8m-12 4h.02"
+                strokeWidth={2}
+                strokeLinecap="round"
+                strokeLinejoin="round"
+              />
+            </svg>
+            <div>
+              <p className="text-lg font-medium text-gray-900">
+                {isDragActive ? 'Drop image here' : 'Drag & drop an image'}
+              </p>
+              <p className="text-sm text-gray-600 mt-1">
+                or click to select a file (PNG, JPG, WebP)
+              </p>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// src/components/TaskSelector.tsx
+import React from 'react';
+import { VisionTask } from '../types';
+
+interface TaskSelectorProps {
+  selectedTask: VisionTask;
+  onTaskSelect: (task: VisionTask) => void;
+}
+
+const TASKS: Array<{id: VisionTask; name: string; description: string; icon: string}> = [
+  {
+    id: 'ocr',
+    name: 'Text Recognition (OCR)',
+    description: 'Detect and recognize text in images',
+    icon: '📝'
+  },
+  {
+    id: 'face_recognition',
+    name: 'Face Recognition',
+    description: 'Detect faces and identify individuals',
+    icon: '👤'
+  },
+  {
+    id: 'pose_estimation',
+    name: 'Pose Estimation',
+    description: 'Detect human body keypoints and poses',
+    icon: '🤸'
+  },
+  {
+    id: 'segmentation',
+    name: 'Image Segmentation',
+    description: 'Segment objects and regions in images',
+    icon: '🎨'
+  },
+  {
+    id: 'object_tracking',
+    name: 'Object Tracking',
+    description: 'Track multiple objects across frames',
+    icon: '🎯'
+  }
+];
+
+export const TaskSelector: React.FC<TaskSelectorProps> = ({ selectedTask, onTaskSelect }) => {
+  return (
+    <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4 max-w-6xl mx-auto">
+      {TASKS.map(task => (
+        <button
+          key={task.id}
+          onClick={() => onTaskSelect(task.id)}
+          className={`
+            p-6 rounded-lg border-2 text-left transition-all duration-200
+            ${selectedTask === task.id
+              ? 'border-blue-500 bg-blue-50 shadow-md'
+              : 'border-gray-200 bg-white hover:border-gray-300 hover:shadow-sm'
+            }
+          `}
+        >
+          <div className="flex items-start space-x-3">
+            <span className="text-3xl">{task.icon}</span>
+            <div className="flex-1">
+              <h3 className="font-semibold text-gray-900 mb-1">
+                {task.name}
+              </h3>
+              <p className="text-sm text-gray-600">
+                {task.description}
+              </p>
+            </div>
+          </div>
+        </button>
+      ))}
+    </div>
+  );
+};
+
+// src/components/ResultsVisualization.tsx
+import React, { useRef, useEffect } from 'react';
+import { OCRResult, FaceResult, PoseResult, SegmentationResult } from '../types';
+
+interface ResultsVisualizationProps {
+  imageUrl: string;
+  task: string;
+  results: any;
+}
+
+export const ResultsVisualization: React.FC<ResultsVisualizationProps> = ({
+  imageUrl,
+  task,
+  results
+}) => {
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const imageRef = useRef<HTMLImageElement>(null);
+
+  useEffect(() => {
+    if (!canvasRef.current || !imageRef.current || !results) return;
+
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const img = imageRef.current;
+
+    if (!ctx) return;
+
+    img.onload = () => {
+      // Set canvas size to match image
+      canvas.width = img.width;
+      canvas.height = img.height;
+
+      // Draw image
+      ctx.drawImage(img, 0, 0);
+
+      // Draw task-specific overlays
+      switch (task) {
+        case 'ocr':
+          drawOCRResults(ctx, results as OCRResult[]);
+          break;
+        case 'face_recognition':
+          drawFaceResults(ctx, results as FaceResult[]);
+          break;
+        case 'pose_estimation':
+          drawPoseResults(ctx, results as PoseResult[]);
+          break;
+        case 'segmentation':
+          drawSegmentationResults(ctx, results as SegmentationResult, img);
+          break;
+      }
+    };
+
+    img.src = imageUrl;
+  }, [imageUrl, task, results]);
+
+  const drawOCRResults = (ctx: CanvasRenderingContext2D, results: OCRResult[]) => {
+    ctx.strokeStyle = '#3B82F6';
+    ctx.lineWidth = 2;
+    ctx.fillStyle = 'rgba(59, 130, 246, 0.1)';
+    ctx.font = '14px monospace';
+
+    results.forEach(result => {
+      const { x1, y1, x2, y2 } = result.bbox;
+
+      // Draw bounding box
+      ctx.fillRect(x1, y1, x2 - x1, y2 - y1);
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+      // Draw text
+      ctx.fillStyle = '#1F2937';
+      ctx.fillText(result.text, x1, y1 - 5);
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.1)';
+    });
+  };
+
+  const drawFaceResults = (ctx: CanvasRenderingContext2D, results: FaceResult[]) => {
+    results.forEach(result => {
+      const { x1, y1, x2, y2 } = result.bbox;
+
+      // Draw bounding box
+      ctx.strokeStyle = '#10B981';
+      ctx.lineWidth = 3;
+      ctx.strokeRect(x1, y1, x2 - x1, y2 - y1);
+
+      // Draw landmarks
+      ctx.fillStyle = '#EF4444';
+      result.landmarks.forEach(landmark => {
+        ctx.beginPath();
+        ctx.arc(landmark.x, landmark.y, 3, 0, 2 * Math.PI);
+        ctx.fill();
+      });
+
+      // Draw identity label
+      if (result.identity) {
+        ctx.fillStyle = '#10B981';
+        ctx.fillRect(x1, y1 - 25, 200, 25);
+        ctx.fillStyle = 'white';
+        ctx.font = 'bold 14px sans-serif';
+        ctx.fillText(
+          `${result.identity} (${(result.confidence * 100).toFixed(1)}%)`,
+          x1 + 5,
+          y1 - 8
+        );
+      }
+    });
+  };
+
+  const drawPoseResults = (ctx: CanvasRenderingContext2D, results: PoseResult[]) => {
+    // Define skeleton connections
+    const connections = [
+      ['nose', 'left_eye'], ['nose', 'right_eye'],
+      ['left_eye', 'left_ear'], ['right_eye', 'right_ear'],
+      ['nose', 'neck'],
+      ['neck', 'left_shoulder'], ['neck', 'right_shoulder'],
+      ['left_shoulder', 'left_elbow'], ['left_elbow', 'left_wrist'],
+      ['right_shoulder', 'right_elbow'], ['right_elbow', 'right_wrist'],
+      ['neck', 'left_hip'], ['neck', 'right_hip'],
+      ['left_hip', 'left_knee'], ['left_knee', 'left_ankle'],
+      ['right_hip', 'right_knee'], ['right_knee', 'right_ankle']
+    ];
+
+    results.forEach(result => {
+      const keypointMap = new Map(
+        result.skeleton.map(kp => [kp.keypoint, kp])
+      );
+
+      // Draw skeleton connections
+      ctx.strokeStyle = '#8B5CF6';
+      ctx.lineWidth = 3;
+      connections.forEach(([start, end]) => {
+        const startKp = keypointMap.get(start);
+        const endKp = keypointMap.get(end);
+        if (startKp && endKp && startKp.confidence > 0.5 && endKp.confidence > 0.5) {
+          ctx.beginPath();
+          ctx.moveTo(startKp.x, startKp.y);
+          ctx.lineTo(endKp.x, endKp.y);
+          ctx.stroke();
+        }
+      });
+
+      // Draw keypoints
+      result.skeleton.forEach(kp => {
+        if (kp.confidence > 0.5) {
+          ctx.fillStyle = '#EC4899';
+          ctx.beginPath();
+          ctx.arc(kp.x, kp.y, 5, 0, 2 * Math.PI);
+          ctx.fill();
+
+          ctx.strokeStyle = 'white';
+          ctx.lineWidth = 2;
+          ctx.stroke();
+        }
+      });
+    });
+  };
+
+  const drawSegmentationResults = (
+    ctx: CanvasRenderingContext2D,
+    result: SegmentationResult,
+    img: HTMLImageElement
+  ) => {
+    // Draw semi-transparent segmentation mask
+    const maskImg = new Image();
+    maskImg.onload = () => {
+      ctx.globalAlpha = 0.5;
+      ctx.drawImage(maskImg, 0, 0, img.width, img.height);
+      ctx.globalAlpha = 1.0;
+
+      // Draw legend
+      ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
+      ctx.fillRect(10, 10, 250, 30 + result.classes.length * 25);
+
+      ctx.fillStyle = 'white';
+      ctx.font = 'bold 14px sans-serif';
+      ctx.fillText('Detected Classes:', 20, 30);
+
+      ctx.font = '12px sans-serif';
+      result.classes.forEach((cls, idx) => {
+        ctx.fillText(`• ${cls}`, 30, 55 + idx * 25);
+      });
+    };
+    maskImg.src = `data:image/png;base64,${result.mask}`;
+  };
+
+  return (
+    <div className="relative max-w-4xl mx-auto">
+      <img ref={imageRef} src={imageUrl} alt="Source" className="hidden" />
+      <canvas
+        ref={canvasRef}
+        className="w-full h-auto border border-gray-300 rounded-lg shadow-lg"
+      />
+    </div>
+  );
+};
+
+// src/App.tsx
+import React, { useState } from 'react';
+import { ImageUpload } from './components/ImageUpload';
+import { TaskSelector } from './components/TaskSelector';
+import { ResultsVisualization } from './components/ResultsVisualization';
+import { VisionTask } from './types';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+export const App: React.FC = () => {
+  const [selectedTask, setSelectedTask] = useState<VisionTask>('ocr');
+  const [uploadedFile, setUploadedFile] = useState<File | null>(null);
+  const [imagePreview, setImagePreview] = useState<string | null>(null);
+  const [results, setResults] = useState<any>(null);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const handleImageUpload = (file: File, preview: string) => {
+    setUploadedFile(file);
+    setImagePreview(preview);
+    setResults(null);
+    setError(null);
+  };
+
+  const handleProcessImage = async () => {
+    if (!uploadedFile) return;
+
+    setIsProcessing(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', uploadedFile);
+
+      const response = await fetch(`${API_BASE_URL}/api/v1/${selectedTask}`, {
+        method: 'POST',
+        body: formData
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Processing failed');
+      }
+
+      const data = await response.json();
+      setResults(data);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Unknown error occurred');
+    } finally {
+      setIsProcessing(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-gradient-to-br from-gray-50 to-gray-100">
+      {/* Header */}
+      <header className="bg-white shadow-sm">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <h1 className="text-3xl font-bold text-gray-900">
+            Computational Vision Platform
+          </h1>
+          <p className="mt-2 text-sm text-gray-600">
+            Unified computer vision API based on L<sub>v</sub> symbolic language
+          </p>
+        </div>
+      </header>
+
+      <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8 space-y-8">
+        {/* Task Selection */}
+        <section>
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">
+            1. Select Vision Task
+          </h2>
+          <TaskSelector
+            selectedTask={selectedTask}
+            onTaskSelect={setSelectedTask}
+          />
+        </section>
+
+        {/* Image Upload */}
+        <section>
+          <h2 className="text-xl font-semibold text-gray-900 mb-4">
+            2. Upload Image
+          </h2>
+          <ImageUpload onImageUpload={handleImageUpload} />
+        </section>
+
+        {/* Process Button */}
+        {uploadedFile && (
+          <section className="text-center">
+            <button
+              onClick={handleProcessImage}
+              disabled={isProcessing}
+              className={`
+                px-8 py-3 rounded-lg font-semibold text-white
+                transition-all duration-200 transform
+                ${isProcessing
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-700 hover:scale-105 shadow-lg hover:shadow-xl'
+                }
+              `}
+            >
+              {isProcessing ? (
+                <span className="flex items-center space-x-2">
+                  <svg className="animate-spin h-5 w-5" viewBox="0 0 24 24">
+                    <circle
+                      className="opacity-25"
+                      cx="12"
+                      cy="12"
+                      r="10"
+                      stroke="currentColor"
+                      strokeWidth="4"
+                      fill="none"
+                    />
+                    <path
+                      className="opacity-75"
+                      fill="currentColor"
+                      d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"
+                    />
+                  </svg>
+                  <span>Processing...</span>
+                </span>
+              ) : (
+                'Process Image'
+              )}
+            </button>
+          </section>
+        )}
+
+        {/* Error Display */}
+        {error && (
+          <section className="max-w-2xl mx-auto">
+            <div className="bg-red-50 border border-red-200 rounded-lg p-4">
+              <div className="flex items-start">
+                <svg
+                  className="h-5 w-5 text-red-400 mt-0.5 mr-3"
+                  fill="currentColor"
+                  viewBox="0 0 20 20"
+                >
+                  <path
+                    fillRule="evenodd"
+                    d="M10 18a8 8 0 100-16 8 8 0 000 16zM8.707 7.293a1 1 0 00-1.414 1.414L8.586 10l-1.293 1.293a1 1 0 101.414 1.414L10 11.414l1.293 1.293a1 1 0 001.414-1.414L11.414 10l1.293-1.293a1 1 0 00-1.414-1.414L10 8.586 8.707 7.293z"
+                    clipRule="evenodd"
+                  />
+                </svg>
+                <div>
+                  <h3 className="text-sm font-medium text-red-800">
+                    Processing Error
+                  </h3>
+                  <p className="text-sm text-red-700 mt-1">{error}</p>
+                </div>
+              </div>
+            </div>
+          </section>
+        )}
+
+        {/* Results Visualization */}
+        {results && imagePreview && (
+          <section>
+            <h2 className="text-xl font-semibold text-gray-900 mb-4">
+              3. Results
+            </h2>
+            <ResultsVisualization
+              imageUrl={imagePreview}
+              task={selectedTask}
+              results={results}
+            />
+
+            {/* JSON Output */}
+            <details className="mt-4 max-w-4xl mx-auto">
+              <summary className="cursor-pointer text-sm font-medium text-gray-700 hover:text-gray-900">
+                View Raw JSON Output
+              </summary>
+              <pre className="mt-2 p-4 bg-gray-900 text-green-400 rounded-lg overflow-x-auto text-xs">
+                {JSON.stringify(results, null, 2)}
+              </pre>
+            </details>
+          </section>
+        )}
+      </main>
+
+      {/* Footer */}
+      <footer className="mt-16 bg-white border-t border-gray-200">
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <p className="text-center text-sm text-gray-600">
+            Powered by L<sub>v</sub> Computational Vision Paradigm
+          </p>
+        </div>
+      </footer>
+    </div>
+  );
+};
+
+export default App;
+```
+
+#### 22.3 TailwindCSS Configuration
+
+**Installation & Setup**:
+
+```bash
+# Install dependencies
+npm install -D tailwindcss postcss autoprefixer
+npm install react-dropzone
+
+# Initialize Tailwind
+npx tailwindcss init -p
+```
+
+**tailwind.config.js**:
+```javascript
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    "./src/**/*.{js,jsx,ts,tsx}",
+  ],
+  theme: {
+    extend: {
+      colors: {
+        vision: {
+          50: '#f0f9ff',
+          100: '#e0f2fe',
+          500: '#0ea5e9',
+          600: '#0284c7',
+          700: '#0369a1',
+        }
+      },
+      animation: {
+        'spin-slow': 'spin 3s linear infinite',
+      }
+    },
+  },
+  plugins: [],
+}
+```
+
+**src/index.css**:
+```css
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer components {
+  .btn-primary {
+    @apply px-6 py-3 bg-blue-600 text-white font-semibold rounded-lg
+           hover:bg-blue-700 transition-colors duration-200
+           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:ring-offset-2;
+  }
+
+  .card {
+    @apply bg-white rounded-lg shadow-md p-6 border border-gray-200
+           hover:shadow-lg transition-shadow duration-200;
+  }
+
+  .input-field {
+    @apply w-full px-4 py-2 border border-gray-300 rounded-lg
+           focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent
+           transition-all duration-200;
+  }
+}
+```
+
+#### 22.4 State Management & API Integration
+
+**Custom Hooks for API Calls**:
+
+```typescript
+// src/hooks/useVisionAPI.ts
+import { useState, useCallback } from 'react';
+import { VisionTask } from '../types';
+
+const API_BASE_URL = process.env.REACT_APP_API_URL || 'http://localhost:8000';
+
+export const useVisionAPI = () => {
+  const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const processImage = useCallback(async (task: VisionTask, file: File) => {
+    setIsLoading(true);
+    setError(null);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+
+      const response = await fetch(`${API_BASE_URL}/api/v1/${task}`, {
+        method: 'POST',
+        body: formData,
+      });
+
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || `HTTP ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (err) {
+      const errorMessage = err instanceof Error ? err.message : 'Unknown error';
+      setError(errorMessage);
+      throw err;
+    } finally {
+      setIsLoading(false);
+    }
+  }, []);
+
+  const submitAsyncTask = useCallback(async (task: VisionTask, file: File) => {
+    const formData = new FormData();
+    formData.append('file', file);
+
+    const response = await fetch(`${API_BASE_URL}/api/v1/async/submit`, {
+      method: 'POST',
+      body: formData,
+      headers: {
+        'X-Task-Type': task,
+      },
+    });
+
+    if (!response.ok) throw new Error('Failed to submit task');
+
+    const { task_id } = await response.json();
+    return task_id;
+  }, []);
+
+  const pollTaskStatus = useCallback(async (taskId: string) => {
+    const response = await fetch(`${API_BASE_URL}/api/v1/async/status/${taskId}`);
+
+    if (!response.ok) throw new Error('Failed to poll task status');
+
+    return response.json();
+  }, []);
+
+  return {
+    processImage,
+    submitAsyncTask,
+    pollTaskStatus,
+    isLoading,
+    error,
+  };
+};
+
+// src/hooks/useAsyncTask.ts
+import { useState, useEffect } from 'react';
+import { useVisionAPI } from './useVisionAPI';
+import { TaskStatus } from '../types';
+
+export const useAsyncTask = (taskId: string | null) => {
+  const [status, setStatus] = useState<TaskStatus | null>(null);
+  const { pollTaskStatus } = useVisionAPI();
+
+  useEffect(() => {
+    if (!taskId) return;
+
+    const interval = setInterval(async () => {
+      try {
+        const taskStatus = await pollTaskStatus(taskId);
+        setStatus(taskStatus);
+
+        if (taskStatus.status === 'completed' || taskStatus.status === 'failed') {
+          clearInterval(interval);
+        }
+      } catch (err) {
+        console.error('Failed to poll task:', err);
+      }
+    }, 1000);  // Poll every second
+
+    return () => clearInterval(interval);
+  }, [taskId, pollTaskStatus]);
+
+  return status;
+};
+```
+
+#### 22.5 Build & Deployment Configuration
+
+**package.json**:
+```json
+{
+  "name": "computational-vision-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-dropzone": "^14.2.3",
+    "typescript": "^5.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^18.2.0",
+    "@types/react-dom": "^18.2.0",
+    "autoprefixer": "^10.4.14",
+    "postcss": "^8.4.24",
+    "tailwindcss": "^3.3.2",
+    "vite": "^4.3.9",
+    "@vitejs/plugin-react": "^4.0.0"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "lint": "eslint src --ext ts,tsx"
+  }
+}
+```
+
+**vite.config.ts**:
+```typescript
+import { defineConfig } from 'vite';
+import react from '@vitejs/plugin-react';
+
+export default defineConfig({
+  plugins: [react()],
+  server: {
+    port: 3000,
+    proxy: {
+      '/api': {
+        target: 'http://localhost:8000',
+        changeOrigin: true,
+      }
+    }
+  },
+  build: {
+    outDir: 'dist',
+    sourcemap: true,
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          'react-vendor': ['react', 'react-dom'],
+        }
+      }
+    }
+  }
+});
+```
+
+**.env.example**:
+```bash
+REACT_APP_API_URL=http://localhost:8000
+REACT_APP_MAX_FILE_SIZE=10485760  # 10MB
+REACT_APP_POLLING_INTERVAL=1000   # 1 second
+```
+
+#### 22.6 Proof: Frontend ∈ L_v (Compositional Structure)
+
+**Theorem**: The React frontend is a valid composition in L_v.
+
+**Proof**:
+
+Define component composition operator `⊗`:
+```
+(A ⊗ B)(props) = A(props) ∪ B(props)
+```
+
+The application structure follows:
+```
+App = Header ⊗ Main ⊗ Footer
+
+Main = TaskSelector ⊗ ImageUpload ⊗ ProcessButton ⊗ Results
+
+Results = Visualization ⊗ JSONOutput
+```
+
+**Associativity**:
+```
+(A ⊗ B) ⊗ C = A ⊗ (B ⊗ C)
+
+Both produce: <>{A}{B}{C}</>
+```
+
+**Identity**:
+```
+Fragment ⊗ A = A ⊗ Fragment = A
+
+Where Fragment = <></>
+```
+
+**Data Flow Composition**:
+```
+Render = Canvas ∘ Draw ∘ Fetch
+
+Where:
+- Fetch: () → Promise<Results>
+- Draw: Results → CanvasCommands
+- Canvas: CanvasCommands → DOM
+```
+
+**Complexity**:
+- **Render**: O(n) where n = number of DOM nodes
+- **API Call**: O(1) network request + O(k) serialization (k = image size)
+- **Canvas Drawing**: O(d) where d = number of detections/keypoints
+
+**Correctness**:
+The UI maintains these invariants:
+1. **Type Safety**: TypeScript ensures Props × State → VirtualDOM
+2. **Immutability**: React state is immutable (setState creates new state)
+3. **Idempotence**: Render(state) always produces same output for same state
+
+Therefore, **Frontend ∈ L_v** (compositional, type-safe, immutable). ∎
+
+#### 22.7 Performance Optimizations
+
+**React Performance Patterns**:
+
+```typescript
+// Memoization for expensive renders
+const MemoizedVisualization = React.memo(ResultsVisualization, (prev, next) => {
+  return prev.imageUrl === next.imageUrl &&
+         prev.task === next.task &&
+         JSON.stringify(prev.results) === JSON.stringify(next.results);
+});
+
+// Lazy loading for code splitting
+const AsyncTaskPanel = React.lazy(() => import('./components/AsyncTaskPanel'));
+
+// Debounced search for history
+import { useDebouncedCallback } from 'use-debounce';
+
+const debouncedSearch = useDebouncedCallback((query: string) => {
+  // Search implementation
+}, 300);
+
+// Virtual scrolling for large result lists
+import { FixedSizeList } from 'react-window';
+
+const ResultsList = ({ results }) => (
+  <FixedSizeList
+    height={600}
+    itemCount={results.length}
+    itemSize={100}
+    width="100%"
+  >
+    {({ index, style }) => (
+      <div style={style}>{results[index]}</div>
+    )}
+  </FixedSizeList>
+);
+```
+
+**Bundle Size Optimization**:
+- Code splitting with React.lazy()
+- Tree shaking unused Tailwind classes
+- Image optimization with next/image patterns
+- Lazy loading visualization canvas
+
+**Target Metrics**:
+- First Contentful Paint: < 1.5s
+- Time to Interactive: < 3.5s
+- Bundle size: < 250KB gzipped
+- Lighthouse score: > 90
+
+This React frontend provides a production-ready, accessible, and performant UI for the computational vision API, following compositional design principles proven to be in L_v.
