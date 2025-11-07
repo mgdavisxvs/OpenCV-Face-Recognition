@@ -3044,4 +3044,661 @@ class PoseEstimationPipeline(Pipeline):
 
 ---
 
-This continues the unified paradigm into Tier 2 with human pose estimation demonstrating temporal modeling capabilities. Shall I continue with the remaining Tier 2 chapters (Gesture Recognition, Image Segmentation, Object Tracking)?
+### Chapter 6: Gesture Recognition
+
+#### 6.1 Mathematical Formulation
+
+**Definition**: Gesture recognition is the problem of mapping a temporal sequence of images (or pose skeletons) to a gesture class label.
+
+$$\text{GestureRecognition}: \mathcal{I}^T \rightarrow \mathcal{G}$$
+
+where:
+- $\mathcal{I}^T = \{I_1, I_2, \ldots, I_T\}$ is a video sequence of length $T$
+- $\mathcal{G} = \{\text{wave}, \text{swipe\_left}, \text{swipe\_right}, \text{thumbs\_up}, \ldots\}$ is the gesture vocabulary
+
+**Decomposition**:
+$$\text{GestureRecognition} = \text{Classify} \circ \text{Encode}_{\text{temporal}} \circ \text{Detect}_{\text{hands}} \circ \text{Transform}$$
+
+Where:
+1. **Transform**: Preprocessing each frame (resize, normalize)
+2. **Detect_hands**: Locate hand keypoints or bounding boxes
+3. **Encode_temporal**: Model temporal dynamics (RNN/LSTM/Transformer)
+4. **Classify**: Map sequence encoding to gesture label
+
+**Two Paradigms**:
+
+1. **Appearance-based**: Process raw RGB frames
+   $$f: \mathbb{R}^{T \times H \times W \times 3} \rightarrow \mathcal{G}$$
+
+2. **Skeleton-based**: Process hand keypoint trajectories
+   $$f: \mathbb{R}^{T \times K \times 2} \rightarrow \mathcal{G}$$
+   where $K = 21$ hand keypoints (5 fingers × 4 joints + 1 wrist)
+
+#### 6.2 Algorithmic Analysis
+
+**Hand Keypoint Detection** (MediaPipe Hands — Bazarevsky et al., 2020):
+
+*Algorithm*:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Hand keypoints H = {(j₁, v₁), ..., (j₂₁, v₂₁)}
+
+Stage 1 - Palm Detection:
+    # Lightweight SSD-style detector
+    palms = PalmDetector(I)  // Detect palm bounding boxes
+    # Uses BlazePalm model (< 1MB, runs at 30 FPS on mobile)
+
+Stage 2 - Hand Landmark Regression:
+    For each palm in palms:
+        # Crop and align hand region
+        hand_crop = CropRotate(I, palm.bbox, palm.rotation)
+
+        # Predict 21 keypoints + hand presence
+        landmarks = HandLandmarkModel(hand_crop)
+        # Architecture: Encoder-decoder with skip connections
+        # Output: 21×3 (x, y, z coordinates) + presence score
+
+        If landmarks.presence > threshold:
+            H.add(landmarks)
+
+Return H
+```
+
+**Hand Keypoint Topology**:
+```
+Wrist (0)
+├── Thumb: (1) → (2) → (3) → (4)
+├── Index: (5) → (6) → (7) → (8)
+├── Middle: (9) → (10) → (11) → (12)
+├── Ring: (13) → (14) → (15) → (16)
+└── Pinky: (17) → (18) → (19) → (20)
+```
+
+**Complexity**:
+- Time: $O(H \cdot W)$ — single forward pass per hand
+- Space: $O(1)$ — lightweight model (~3MB)
+- Real-time: 30+ FPS on mobile CPU
+
+**Accuracy**:
+- 21-landmark detection: 95.7% on benchmark dataset
+
+---
+
+**Temporal Modeling** (3 Approaches):
+
+**Approach 1: 3D Convolutional Networks (C3D)**
+
+*Algorithm*:
+```
+Input: Video clip V ∈ ℝ^(T×H×W×3)
+Output: Gesture logits p ∈ ℝ^{|G|}
+
+1. 3D Convolution:
+   # Convolve over space AND time
+   For each layer ℓ:
+       F_ℓ = Conv3D(F_{ℓ-1}, kernel_size=(3,3,3))
+       F_ℓ = ReLU(F_ℓ)
+       F_ℓ = MaxPool3D(F_ℓ, pool_size=(1,2,2))
+
+   # Typical architecture:
+   # Input: 16×112×112×3
+   # Conv3D-64 → Conv3D-128 → Conv3D-256 → Conv3D-512
+   # FC-4096 → FC-4096 → FC-|G|
+
+2. Global Pooling:
+   features = GlobalAveragePool(F_L)
+
+3. Classification:
+   p = Softmax(Linear(features))
+
+Return argmax(p)
+```
+
+**Properties**:
+- Jointly learns spatial and temporal features
+- Treats time as additional dimension
+- End-to-end trainable
+
+**Complexity**:
+- Time: $O(T \cdot H \cdot W \cdot k)$ where k = kernel count
+- Space: $O(T \cdot H \cdot W \cdot k)$
+- Parameters: ~78M (C3D model)
+
+---
+
+**Approach 2: Recurrent Neural Networks (LSTM)**
+
+*Algorithm*:
+```
+Input: Sequence of hand keypoints {K₁, K₂, ..., K_T}
+       where K_t ∈ ℝ^(21×2) (21 keypoints, 2D coords)
+Output: Gesture label g ∈ G
+
+1. Feature Extraction (per frame):
+   For t = 1 to T:
+       # Flatten keypoints to vector
+       x_t = Flatten(K_t)  // ℝ^42
+
+       # Optional: Embed to higher dimension
+       x_t = Linear(x_t)  // ℝ^42 → ℝ^128
+
+2. Temporal Encoding (Bidirectional LSTM):
+   h_forward, h_backward = BiLSTM(x₁, ..., x_T)
+
+   # Forward LSTM:
+   for t = 1 to T:
+       h_t^f = LSTM(x_t, h_{t-1}^f)
+
+   # Backward LSTM:
+   for t = T down to 1:
+       h_t^b = LSTM(x_t, h_{t+1}^b)
+
+   # Concatenate final states
+   h = Concat(h_T^f, h_1^b)  // ℝ^(2×hidden_size)
+
+3. Classification:
+   p = Softmax(Linear(h))
+   g = argmax(p)
+
+Return g
+```
+
+**Properties**:
+- Models sequential dependencies explicitly
+- Handles variable-length sequences naturally
+- Bidirectional captures past and future context
+
+**Complexity**:
+- Time: $O(T \cdot d^2)$ where d = hidden size
+- Space: $O(T \cdot d)$ for storing hidden states
+- Parameters: ~2M (typical LSTM-based model)
+
+---
+
+**Approach 3: Temporal Transformer**
+
+*Algorithm* (Attention-based):
+```
+Input: Keypoint sequence {K₁, ..., K_T}
+Output: Gesture label g
+
+1. Embedding:
+   For t = 1 to T:
+       # Spatial encoding
+       x_t = Linear(Flatten(K_t))  // ℝ^42 → ℝ^d
+
+       # Add positional encoding
+       x_t = x_t + PositionalEncoding(t)
+
+2. Multi-Head Self-Attention:
+   For each layer ℓ:
+       # Compute attention weights
+       Q = x W_Q, K = x W_K, V = x W_V
+
+       Attention(Q, K, V) = Softmax(QK^T / √d_k) V
+
+       # Multi-head attention
+       MultiHead = Concat(head₁, ..., head_h) W_O
+
+       # Feed-forward
+       x = LayerNorm(x + MultiHead)
+       x = LayerNorm(x + FFN(x))
+
+3. Aggregate:
+   # Class token or mean pooling
+   features = Mean(x₁, ..., x_T)
+
+4. Classification:
+   p = Softmax(Linear(features))
+   g = argmax(p)
+
+Return g
+```
+
+**Properties**:
+- Parallel processing (unlike RNN)
+- Long-range dependencies via attention
+- State-of-the-art for many sequence tasks
+
+**Complexity**:
+- Time: $O(T^2 \cdot d)$ — quadratic in sequence length
+- Space: $O(T^2)$ for attention matrix
+- Parameters: ~10M (typical Transformer)
+
+**Accuracy Comparison**:
+- C3D: ~85% on UCF-101 (appearance-based)
+- LSTM: ~88% on hand gesture datasets (skeleton-based)
+- Transformer: ~92% on NTU RGB+D (skeleton-based)
+
+#### 6.3 Implementation
+
+```python
+"""
+Chapter 6: Gesture Recognition Implementation
+
+Demonstrates gesture recognition as composition of:
+    - Hand keypoint detection (MediaPipe-style)
+    - Temporal encoding (LSTM/Transformer)
+    - Gesture classification
+"""
+
+from typing import List, Dict, Tuple, Optional
+from collections import deque
+import torch.nn as nn
+
+
+@dataclass(frozen=True)
+class HandKeypoints:
+    """
+    21 hand keypoints following MediaPipe topology.
+
+    Keypoint Indices:
+        0: Wrist
+        1-4: Thumb (CMC, MCP, IP, TIP)
+        5-8: Index finger (MCP, PIP, DIP, TIP)
+        9-12: Middle finger (MCP, PIP, DIP, TIP)
+        13-16: Ring finger (MCP, PIP, DIP, TIP)
+        17-20: Pinky (MCP, PIP, DIP, TIP)
+    """
+    keypoints: List[Keypoint]  # Length = 21
+    handedness: str  # 'left' or 'right'
+    confidence: float
+
+    def __post_init__(self):
+        assert len(self.keypoints) == 21, "Hand requires 21 keypoints"
+        assert self.handedness in ['left', 'right']
+        assert 0 <= self.confidence <= 1
+
+    def to_vector(self) -> np.ndarray:
+        """
+        Convert keypoints to flat feature vector.
+
+        Returns:
+            Vector ∈ ℝ^42 (21 keypoints × 2 coords)
+        """
+        coords = []
+        for kp in self.keypoints:
+            coords.extend([kp.location.x, kp.location.y])
+        return np.array(coords, dtype=np.float32)
+
+    def normalize(self, reference_point: Optional[Point] = None) -> 'HandKeypoints':
+        """
+        Normalize keypoints to be translation and scale invariant.
+
+        Algorithm:
+            1. Center at wrist (or reference point)
+            2. Scale by hand size (wrist to middle finger tip)
+
+        This makes gestures invariant to hand position/size.
+        """
+        if reference_point is None:
+            reference_point = self.keypoints[0].location  # Wrist
+
+        # Compute hand size (wrist to middle finger tip)
+        wrist = self.keypoints[0].location
+        middle_tip = self.keypoints[12].location
+        hand_size = wrist.distance_to(middle_tip)
+
+        if hand_size < 1e-6:
+            return self  # Avoid division by zero
+
+        # Normalize each keypoint
+        normalized_kps = []
+        for kp in self.keypoints:
+            # Translate to origin
+            x_norm = (kp.location.x - reference_point.x) / hand_size
+            y_norm = (kp.location.y - reference_point.y) / hand_size
+
+            normalized_kps.append(Keypoint(
+                location=Point(x_norm, y_norm),
+                visibility=kp.visibility,
+                keypoint_type=kp.keypoint_type
+            ))
+
+        return HandKeypoints(
+            keypoints=normalized_kps,
+            handedness=self.handedness,
+            confidence=self.confidence
+        )
+
+
+@dataclass
+class Gesture:
+    """
+    A recognized gesture with temporal extent.
+
+    Mathematical Definition:
+        G = (label, [t_start, t_end], confidence)
+    """
+    label: str  # 'wave', 'swipe_left', 'thumbs_up', etc.
+    start_frame: int
+    end_frame: int
+    confidence: float
+
+    def __post_init__(self):
+        assert 0 <= self.confidence <= 1
+        assert self.start_frame <= self.end_frame
+
+
+class HandKeypointDetector(Detector):
+    """
+    Hand keypoint detector (MediaPipe Hands style).
+
+    Two-stage pipeline:
+        1. Palm detection (lightweight SSD)
+        2. Hand landmark regression (21 keypoints)
+
+    Performance:
+        - 30+ FPS on mobile CPU
+        - 95.7% landmark accuracy
+        - Model size: ~3MB
+    """
+
+    def __init__(self,
+                 max_num_hands: int = 2,
+                 min_detection_confidence: float = 0.5,
+                 device: str = 'cpu'):
+        """
+        Initialize hand detector.
+
+        Args:
+            max_num_hands: Maximum number of hands to detect
+            min_detection_confidence: Minimum confidence for detection
+            device: 'cpu' or 'cuda'
+        """
+        self.max_num_hands = max_num_hands
+        self.min_detection_confidence = min_detection_confidence
+        self.device = device
+
+        # Load models (placeholder)
+        # In production:
+        # import mediapipe as mp
+        # self.hands = mp.solutions.hands.Hands(
+        #     max_num_hands=max_num_hands,
+        #     min_detection_confidence=min_detection_confidence
+        # )
+
+        # Keypoint names
+        self.keypoint_names = [
+            'wrist',
+            'thumb_cmc', 'thumb_mcp', 'thumb_ip', 'thumb_tip',
+            'index_mcp', 'index_pip', 'index_dip', 'index_tip',
+            'middle_mcp', 'middle_pip', 'middle_dip', 'middle_tip',
+            'ring_mcp', 'ring_pip', 'ring_dip', 'ring_tip',
+            'pinky_mcp', 'pinky_pip', 'pinky_dip', 'pinky_tip'
+        ]
+
+    def __call__(self, image: Image) -> List[HandKeypoints]:
+        """
+        Detect hands and their 21 keypoints.
+
+        Algorithm:
+            1. Detect palms (bounding boxes)
+            2. For each palm: regress 21 landmarks
+            3. Return list of HandKeypoints
+
+        Complexity: O(H·W) for detection + O(n) for landmark regression
+
+        Returns:
+            List of detected hands (up to max_num_hands)
+        """
+        import cv2
+
+        # Convert to format expected by detector
+        img_cv = (image.tensor * 255).astype(np.uint8)
+        img_rgb = cv2.cvtColor(img_cv, cv2.COLOR_BGR2RGB)
+
+        # Placeholder: In production, use MediaPipe
+        # results = self.hands.process(img_rgb)
+
+        # For demonstration, return empty list
+        hands = []
+
+        # Full implementation would process results.multi_hand_landmarks
+        # and convert to HandKeypoints objects
+
+        return hands
+
+
+class GestureLSTMClassifier(nn.Module):
+    """
+    LSTM-based gesture classifier.
+
+    Architecture:
+        Input sequence → BiLSTM → FC → Softmax
+
+    Handles variable-length sequences via packing.
+    """
+
+    def __init__(self,
+                 input_size: int = 42,  # 21 keypoints × 2 coords
+                 hidden_size: int = 128,
+                 num_layers: int = 2,
+                 num_classes: int = 10,
+                 dropout: float = 0.3):
+        """
+        Initialize LSTM classifier.
+
+        Args:
+            input_size: Dimension of input features
+            hidden_size: LSTM hidden state dimension
+            num_layers: Number of LSTM layers
+            num_classes: Number of gesture classes
+            dropout: Dropout probability
+        """
+        super().__init__()
+
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.num_classes = num_classes
+
+        # Bidirectional LSTM
+        self.lstm = nn.LSTM(
+            input_size=input_size,
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            bidirectional=True,
+            dropout=dropout if num_layers > 1 else 0
+        )
+
+        # Classification head
+        self.fc = nn.Sequential(
+            nn.Linear(hidden_size * 2, hidden_size),  # *2 for bidirectional
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, num_classes)
+        )
+
+    def forward(self, x: torch.Tensor, lengths: Optional[torch.Tensor] = None):
+        """
+        Forward pass.
+
+        Args:
+            x: Input sequences [batch, seq_len, input_size]
+            lengths: Actual sequence lengths (for packing)
+
+        Returns:
+            Gesture logits [batch, num_classes]
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # Pack padded sequences (if lengths provided)
+        if lengths is not None:
+            x = nn.utils.rnn.pack_padded_sequence(
+                x, lengths, batch_first=True, enforce_sorted=False
+            )
+
+        # LSTM encoding
+        lstm_out, (h_n, c_n) = self.lstm(x)
+
+        # Unpack if necessary
+        if lengths is not None:
+            lstm_out, _ = nn.utils.rnn.pad_packed_sequence(
+                lstm_out, batch_first=True
+            )
+
+        # Use final hidden state (concatenate forward and backward)
+        # h_n shape: [num_layers*2, batch, hidden_size]
+        forward_hidden = h_n[-2, :, :]  # Last layer, forward direction
+        backward_hidden = h_n[-1, :, :]  # Last layer, backward direction
+        final_hidden = torch.cat([forward_hidden, backward_hidden], dim=1)
+
+        # Classification
+        logits = self.fc(final_hidden)
+
+        return logits
+
+
+class GestureRecognitionPipeline(Pipeline):
+    """
+    Complete gesture recognition system.
+
+    Mathematical Formulation:
+        GestureRecognition = Classify ∘ EncodeTemporal ∘ DetectHands ∘ Transform
+
+    Proof that GestureRecognition ∈ L_v:
+        - Transform: Resize, Normalize ∈ {Transform} (per-frame)
+        - DetectHands: HandKeypointDetector ∈ {Detector}
+        - EncodeTemporal: LSTM ∈ {Reasoner} (operates on sequence)
+        - Classify: Softmax classifier ∈ {Reasoner}
+
+    Therefore, gesture recognition is a composition of primitives. ∎
+
+    Gesture Vocabulary:
+        - Static: 'thumbs_up', 'peace_sign', 'ok_sign', 'fist'
+        - Dynamic: 'wave', 'swipe_left', 'swipe_right', 'zoom_in', 'zoom_out'
+
+    Use Cases:
+        - Touchless control (smart home, medical settings)
+        - Sign language recognition
+        - Gaming interfaces
+        - AR/VR interaction
+        - Accessibility (motor impairment assistance)
+    """
+
+    def __init__(self,
+                 gesture_classes: List[str],
+                 sequence_length: int = 30,
+                 device: str = 'cpu'):
+        """
+        Initialize gesture recognition pipeline.
+
+        Args:
+            gesture_classes: List of gesture labels
+            sequence_length: Number of frames to buffer
+            device: 'cpu' or 'cuda'
+        """
+        self.gesture_classes = gesture_classes
+        self.sequence_length = sequence_length
+        self.device = device
+
+        # Components
+        self.hand_detector = HandKeypointDetector(device=device)
+        self.classifier = GestureLSTMClassifier(
+            num_classes=len(gesture_classes)
+        ).to(device)
+        self.classifier.eval()
+
+        # Preprocessing
+        self.preprocess = Pipeline(
+            Resize(256, 256),
+            Normalize()
+        )
+
+        # Temporal buffer
+        self.keypoint_buffer = deque(maxlen=sequence_length)
+
+        # Gesture smoothing (temporal voting)
+        self.prediction_buffer = deque(maxlen=10)
+
+    def __call__(self, image: Image) -> Optional[Gesture]:
+        """
+        Process frame and recognize gesture.
+
+        Returns:
+            Detected Gesture or None if no gesture detected
+
+        Complexity:
+            O(H·W + T·d²) where:
+            - H×W = image size
+            - T = sequence length
+            - d = LSTM hidden size
+        """
+        # Step 1: Preprocess
+        preprocessed = self.preprocess(image)
+
+        # Step 2: Detect hands
+        hands = self.hand_detector(preprocessed)
+
+        if len(hands) == 0:
+            # No hands detected
+            self.keypoint_buffer.clear()
+            return None
+
+        # Use first detected hand (can extend to multi-hand)
+        hand = hands[0]
+
+        # Normalize keypoints (translation/scale invariant)
+        normalized_hand = hand.normalize()
+
+        # Step 3: Buffer keypoints
+        self.keypoint_buffer.append(normalized_hand.to_vector())
+
+        # Step 4: Classify gesture (if buffer is full)
+        if len(self.keypoint_buffer) < self.sequence_length:
+            return None  # Not enough frames yet
+
+        # Convert buffer to tensor [1, seq_len, 42]
+        sequence = np.stack(list(self.keypoint_buffer))
+        sequence_tensor = torch.from_numpy(sequence).unsqueeze(0).to(self.device)
+
+        # Forward pass
+        with torch.no_grad():
+            logits = self.classifier(sequence_tensor)
+            probs = torch.softmax(logits, dim=1)
+            confidence, pred_idx = torch.max(probs, dim=1)
+
+        pred_label = self.gesture_classes[pred_idx.item()]
+        pred_confidence = confidence.item()
+
+        # Step 5: Temporal smoothing (majority vote over last 10 predictions)
+        self.prediction_buffer.append((pred_label, pred_confidence))
+
+        # Count occurrences
+        from collections import Counter
+        label_counts = Counter([label for label, _ in self.prediction_buffer])
+        most_common_label, count = label_counts.most_common(1)[0]
+
+        # Require at least 60% agreement
+        if count < len(self.prediction_buffer) * 0.6:
+            return None
+
+        # Average confidence for this label
+        avg_confidence = np.mean([
+            conf for label, conf in self.prediction_buffer
+            if label == most_common_label
+        ])
+
+        # Create gesture
+        gesture = Gesture(
+            label=most_common_label,
+            start_frame=0,  # Would track in production
+            end_frame=len(self.keypoint_buffer),
+            confidence=float(avg_confidence)
+        )
+
+        return gesture
+
+    def reset(self):
+        """Reset temporal buffers (call when starting new video)."""
+        self.keypoint_buffer.clear()
+        self.prediction_buffer.clear()
+
+
+```
+
+---
+
+This completes Chapter 6, demonstrating gesture recognition through temporal sequence modeling with three different approaches (C3D, LSTM, Transformer). All proven to be compositions of L_v primitives.
