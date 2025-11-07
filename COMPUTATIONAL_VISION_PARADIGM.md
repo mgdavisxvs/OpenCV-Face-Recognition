@@ -2424,4 +2424,624 @@ This literate program embodies the philosophical mandate: **not 28 separate feat
 
 ---
 
-*Next: Would you like me to continue with Part III (Tier 2), or would you prefer the Web Application implementation first (Part VII)?*
+## Part III: Tier 2 — Advanced Vision Capabilities
+
+### Chapter 5: Human Pose Estimation
+
+#### 5.1 Mathematical Formulation
+
+**Definition**: Human pose estimation is the problem of mapping an image $I$ containing a person to a skeletal configuration $S = \{(j_1, v_1), \ldots, (j_K, v_K)\}$ where:
+- $j_i \in \mathbb{R}^2$ is the 2D location of keypoint $i$
+- $v_i \in [0, 1]$ is the visibility/confidence score
+- $K = 17$ for COCO keypoints (nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles)
+
+**Decomposition**:
+$$\text{PoseEstimation}: \mathcal{I} \rightarrow \mathcal{S} = \text{BuildSkeleton} \circ \text{Detect}_{\text{keypoints}} \circ \text{Transform}$$
+
+Where:
+1. **Transform**: Preprocessing (resize, normalize, augment)
+2. **Detect_keypoints**: Locate 17 body keypoints via heatmaps
+3. **BuildSkeleton**: Connect keypoints into skeletal structure
+
+**Skeleton Graph**:
+$$G = (V, E) \text{ where } V = \{j_1, \ldots, j_K\}, E = \{(j_i, j_j) : \text{bones}\}$$
+
+Edges represent anatomical connections:
+- (nose, left_eye), (nose, right_eye)
+- (left_shoulder, left_elbow), (left_elbow, left_wrist)
+- (left_hip, left_knee), (left_knee, left_ankle)
+- etc.
+
+#### 5.2 Algorithmic Analysis
+
+**Keypoint Detection** (OpenPose — Cao et al., 2019):
+
+*Algorithm*:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Keypoints K = {(j₁, v₁), ..., (jₖ, vₖ)}
+        Part Affinity Fields (PAFs) for association
+
+Stage 1 - Feature Extraction:
+    F = VGG19_backbone(I)  // Extract features
+
+Stage 2 - Multi-Stage CNN:
+    # Iteratively refine predictions
+    For stage t = 1 to T:
+        # Keypoint heatmaps
+        H_t = KeypointBranch(F, H_{t-1})  // K heatmaps
+
+        # Part Affinity Fields (directional fields)
+        L_t = PAFBranch(F, L_{t-1})  // K×2 vector fields
+
+Stage 3 - Greedy Parsing:
+    # Extract keypoints from heatmaps
+    For each keypoint type k:
+        j_k = argmax_{(x,y)} H_T[k, x, y]
+        v_k = H_T[k, j_k]
+
+    # Associate keypoints using PAFs
+    # (resolves multiple people in image)
+    For each limb (k_i, k_j):
+        score = ∫ L_T · (j_j - j_i) dt  // Line integral
+        If score > threshold:
+            Connect j_i to j_j
+
+Return K
+```
+
+**Part Affinity Fields (PAFs)**:
+- Encode both location AND orientation of limbs
+- Vector field $L(x, y) \in \mathbb{R}^2$ points along limb direction
+- Enables multi-person association via line integral matching
+
+**Complexity**:
+- Time: $O(T \cdot H \cdot W \cdot k)$ where T = stages (typically 6)
+- Space: $O(H \cdot W \cdot K)$ for heatmaps
+- Real-time: 8.8 FPS on 640×480 (GPU)
+
+**Accuracy**:
+- COCO keypoints: AP 65.3%
+- Multi-person: Handles arbitrary number of people
+
+---
+
+**Alternative: HRNet** (High-Resolution Network — Sun et al., 2019):
+
+*Key Innovation*: Maintain high-resolution representations throughout network
+
+*Algorithm*:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Heatmaps H ∈ ℝ^(K×H'×W')
+
+1. Stem:
+   F = Conv(I)  // Initial features at resolution H/4
+
+2. Parallel Multi-Resolution Streams:
+   # Maintain 4 parallel branches at different resolutions
+   For each stage:
+       F_high = HighResStream(F_high)      // H/4 resolution
+       F_mid1 = MidResStream1(F_mid1)      // H/8 resolution
+       F_mid2 = MidResStream2(F_mid2)      // H/16 resolution
+       F_low = LowResStream(F_low)         // H/32 resolution
+
+       # Exchange information between resolutions
+       F_high, F_mid1, F_mid2, F_low = FusionModule(
+           F_high, F_mid1, F_mid2, F_low
+       )
+
+3. Keypoint Prediction:
+   H = Conv(F_high)  // Predict heatmaps at highest resolution
+
+4. Extract Keypoints:
+   For each keypoint k:
+       j_k = argmax H[k, :, :]
+       v_k = H[k, j_k]
+
+Return {(j₁, v₁), ..., (jₖ, vₖ)}
+```
+
+**Advantages**:
+- Better localization (maintains high resolution)
+- Stronger representations (multi-scale fusion)
+- State-of-the-art accuracy
+
+**Complexity**:
+- Time: $O(H \cdot W \cdot k)$ — single forward pass
+- Space: $O(H \cdot W \cdot k)$ for parallel branches
+- Real-time: 10 FPS on 640×480 (GPU)
+
+**Accuracy**:
+- COCO keypoints: AP 75.5% (+10% over OpenPose)
+
+#### 5.3 Temporal Tracking
+
+**Problem**: Single-frame pose estimation is noisy. Temporal smoothing improves robustness.
+
+**Algorithm** (Kalman Filtering for Pose Tracking):
+```
+Input: Keypoint sequence {K₁, K₂, ..., Kₜ}
+Output: Smoothed trajectory {K̂₁, K̂₂, ..., K̂ₜ}
+
+For each keypoint k:
+    # State: [x, y, vₓ, vᵧ]ᵀ (position + velocity)
+    x_k,0 = [j_k,1, 0, 0]ᵀ  // Initialize at first detection
+
+    For t = 2 to T:
+        # Predict
+        x_k,t|t-1 = F · x_k,t-1  // F = state transition matrix
+        P_k,t|t-1 = F · P_k,t-1 · Fᵀ + Q  // Covariance prediction
+
+        # Update (with new detection)
+        y_k,t = j_k,t - H · x_k,t|t-1  // Innovation (residual)
+        S_k,t = H · P_k,t|t-1 · Hᵀ + R  // Innovation covariance
+        K_k,t = P_k,t|t-1 · Hᵀ · S_k,t⁻¹  // Kalman gain
+
+        x_k,t = x_k,t|t-1 + K_k,t · y_k,t  // State update
+        P_k,t = (I - K_k,t · H) · P_k,t|t-1  // Covariance update
+
+        K̂_k,t = x_k,t[:2]  // Extract smoothed position
+
+Return smoothed keypoints
+```
+
+**Properties**:
+- Optimal linear estimator (minimizes mean squared error)
+- Handles occlusions via prediction when detection is missing
+- Reduces jitter in video sequences
+
+**Complexity**: $O(K \cdot T)$ — linear in keypoints and time
+
+#### 5.4 Implementation
+
+```python
+"""
+Chapter 5: Human Pose Estimation Implementation
+
+Demonstrates pose estimation as composition of:
+    - Keypoint detection (heatmap-based)
+    - Skeleton construction (graph assembly)
+    - Temporal tracking (Kalman filtering)
+"""
+
+from typing import List, Optional, Tuple
+from collections import deque
+
+
+@dataclass(frozen=True)
+class Keypoint:
+    """
+    A single body keypoint.
+
+    Mathematical Definition:
+        K = (j, v, t) where:
+        - j ∈ ℝ²: 2D location (x, y)
+        - v ∈ [0, 1]: visibility/confidence
+        - t: keypoint type (e.g., 'nose', 'left_wrist')
+    """
+    location: Point
+    visibility: float
+    keypoint_type: str
+
+    def __post_init__(self):
+        assert 0 <= self.visibility <= 1
+
+
+@dataclass(frozen=True)
+class Skeleton:
+    """
+    A skeletal pose with 17 keypoints.
+
+    COCO Keypoint Format:
+        0: nose, 1: left_eye, 2: right_eye, 3: left_ear, 4: right_ear,
+        5: left_shoulder, 6: right_shoulder, 7: left_elbow, 8: right_elbow,
+        9: left_wrist, 10: right_wrist, 11: left_hip, 12: right_hip,
+        13: left_knee, 14: right_knee, 15: left_ankle, 16: right_ankle
+
+    Bone Connections (edges):
+        Defines anatomical structure G = (V, E)
+    """
+    keypoints: List[Keypoint]  # Length = 17
+    confidence: float  # Overall pose confidence
+    person_id: Optional[int] = None  # For multi-person tracking
+
+    # Anatomical connections (bones)
+    BONES = [
+        (0, 1), (0, 2),  # nose to eyes
+        (1, 3), (2, 4),  # eyes to ears
+        (0, 5), (0, 6),  # nose to shoulders
+        (5, 7), (7, 9),  # left arm
+        (6, 8), (8, 10),  # right arm
+        (5, 11), (6, 12),  # shoulders to hips
+        (11, 12),  # hip connection
+        (11, 13), (13, 15),  # left leg
+        (12, 14), (14, 16)  # right leg
+    ]
+
+    def __post_init__(self):
+        assert len(self.keypoints) == 17, "COCO format requires 17 keypoints"
+        assert 0 <= self.confidence <= 1
+
+    def get_bone_vector(self, bone_idx: int) -> Optional[np.ndarray]:
+        """
+        Get directional vector for a bone.
+
+        Returns:
+            Vector from keypoint_i to keypoint_j, or None if invisible
+        """
+        i, j = self.BONES[bone_idx]
+        kp_i, kp_j = self.keypoints[i], self.keypoints[j]
+
+        if kp_i.visibility < 0.5 or kp_j.visibility < 0.5:
+            return None
+
+        vector = np.array([
+            kp_j.location.x - kp_i.location.x,
+            kp_j.location.y - kp_i.location.y
+        ])
+        return vector
+
+    def bone_length(self, bone_idx: int) -> Optional[float]:
+        """
+        Compute Euclidean length of bone.
+
+        Returns:
+            ||j_j - j_i||₂
+        """
+        vector = self.get_bone_vector(bone_idx)
+        if vector is None:
+            return None
+        return np.linalg.norm(vector)
+
+
+class KeypointDetector(Detector):
+    """
+    Keypoint detector using heatmap-based approach.
+
+    Architecture:
+        Input → CNN backbone
+              → Keypoint heatmaps (K channels)
+              → Argmax per channel
+              → Keypoint locations
+
+    Can use either:
+    - HRNet (state-of-art, AP 75.5%)
+    - OpenPose (with PAFs for multi-person)
+    """
+
+    def __init__(self,
+                 model_type: str = 'hrnet',
+                 confidence_threshold: float = 0.3,
+                 device: str = 'cpu'):
+        """
+        Initialize keypoint detector.
+
+        Args:
+            model_type: 'hrnet' or 'openpose'
+            confidence_threshold: Minimum visibility score
+            device: 'cpu' or 'cuda'
+        """
+        self.model_type = model_type
+        self.confidence_threshold = confidence_threshold
+        self.device = device
+
+        # COCO keypoint names
+        self.keypoint_names = [
+            'nose', 'left_eye', 'right_eye', 'left_ear', 'right_ear',
+            'left_shoulder', 'right_shoulder', 'left_elbow', 'right_elbow',
+            'left_wrist', 'right_wrist', 'left_hip', 'right_hip',
+            'left_knee', 'right_knee', 'left_ankle', 'right_ankle'
+        ]
+
+        # Load model (placeholder)
+        # In production:
+        # if model_type == 'hrnet':
+        #     from mmpose.apis import init_pose_model
+        #     self.model = init_pose_model(config, checkpoint, device)
+        # elif model_type == 'openpose':
+        #     from openpose import pyopenpose as op
+        #     self.model = op.PoseEstimator()
+
+    def __call__(self, image: Image) -> List[Skeleton]:
+        """
+        Detect poses in image.
+
+        Algorithm:
+            1. Forward pass → heatmaps H ∈ ℝ^(K×H'×W')
+            2. For each keypoint k: j_k = argmax H[k]
+            3. Group keypoints into skeletons (multi-person)
+            4. Return list of Skeleton objects
+
+        Complexity: O(H·W·k) for forward pass + O(K·n) for grouping
+
+        Returns:
+            List of detected skeletons (one per person)
+        """
+        import cv2
+
+        # Convert to format for model
+        img_cv = (image.tensor * 255).astype(np.uint8)
+
+        # Placeholder: In production, run actual pose model
+        # heatmaps = self.model(img_cv)
+
+        # For demonstration, return empty list
+        # (Full implementation would process heatmaps)
+        skeletons = []
+
+        return skeletons
+
+    def _extract_keypoints_from_heatmaps(self,
+                                         heatmaps: np.ndarray) -> List[Keypoint]:
+        """
+        Extract keypoints from heatmap predictions.
+
+        Algorithm:
+            For each keypoint k:
+                1. Find local maximum in heatmap H[k]
+                2. Refine location with subpixel accuracy (quadratic fitting)
+                3. Read confidence value at location
+
+        Args:
+            heatmaps: K×H'×W' array of per-keypoint heatmaps
+
+        Returns:
+            List of 17 keypoints
+        """
+        K, H, W = heatmaps.shape
+        keypoints = []
+
+        for k in range(K):
+            heatmap = heatmaps[k]
+
+            # Find maximum
+            y, x = np.unravel_index(np.argmax(heatmap), heatmap.shape)
+            confidence = float(heatmap[y, x])
+
+            # Subpixel refinement (quadratic fitting)
+            if 0 < x < W - 1 and 0 < y < H - 1:
+                # Compute second derivatives
+                dx = (heatmap[y, x + 1] - heatmap[y, x - 1]) / 2
+                dy = (heatmap[y + 1, x] - heatmap[y - 1, x]) / 2
+
+                # Refine location
+                x_refined = x + 0.25 * dx
+                y_refined = y + 0.25 * dy
+            else:
+                x_refined, y_refined = x, y
+
+            # Create keypoint
+            keypoint = Keypoint(
+                location=Point(x_refined, y_refined),
+                visibility=confidence,
+                keypoint_type=self.keypoint_names[k]
+            )
+            keypoints.append(keypoint)
+
+        return keypoints
+
+
+class KalmanPoseTracker:
+    """
+    Temporal pose tracking using Kalman filter.
+
+    State Space Model:
+        State: x = [x, y, vₓ, vᵧ]ᵀ for each keypoint
+        Observation: z = [x, y]ᵀ
+
+    Dynamics:
+        x_t = F·x_{t-1} + w  where w ~ N(0, Q)
+        z_t = H·x_t + v      where v ~ N(0, R)
+
+    This smooths noisy keypoint detections over time.
+    """
+
+    def __init__(self,
+                 process_noise: float = 0.01,
+                 measurement_noise: float = 0.1):
+        """
+        Initialize Kalman tracker.
+
+        Args:
+            process_noise: Process noise covariance (Q)
+            measurement_noise: Measurement noise covariance (R)
+        """
+        self.process_noise = process_noise
+        self.measurement_noise = measurement_noise
+
+        # State for each keypoint: [x, y, vx, vy]
+        self.states = [None] * 17  # One per keypoint
+        self.covariances = [None] * 17
+
+        # State transition matrix (constant velocity model)
+        self.F = np.array([
+            [1, 0, 1, 0],  # x_{t+1} = x_t + vx_t
+            [0, 1, 0, 1],  # y_{t+1} = y_t + vy_t
+            [0, 0, 1, 0],  # vx_{t+1} = vx_t
+            [0, 0, 0, 1]   # vy_{t+1} = vy_t
+        ])
+
+        # Observation matrix (we observe only position)
+        self.H = np.array([
+            [1, 0, 0, 0],  # z_x = x
+            [0, 1, 0, 0]   # z_y = y
+        ])
+
+        # Process noise covariance
+        self.Q = np.eye(4) * process_noise
+
+        # Measurement noise covariance
+        self.R = np.eye(2) * measurement_noise
+
+    def update(self, skeleton: Skeleton) -> Skeleton:
+        """
+        Update tracker with new skeleton detection and return smoothed version.
+
+        Algorithm:
+            For each keypoint:
+                1. Predict: x_{t|t-1} = F·x_{t-1}
+                2. Update: x_t = x_{t|t-1} + K·(z_t - H·x_{t|t-1})
+                where K is Kalman gain
+
+        Complexity: O(K) where K = 17 keypoints
+
+        Returns:
+            Smoothed skeleton with reduced jitter
+        """
+        smoothed_keypoints = []
+
+        for k, keypoint in enumerate(skeleton.keypoints):
+            if keypoint.visibility < 0.3:
+                # Low confidence → use prediction only
+                if self.states[k] is not None:
+                    # Predict
+                    x_pred = self.F @ self.states[k]
+                    P_pred = self.F @ self.covariances[k] @ self.F.T + self.Q
+
+                    self.states[k] = x_pred
+                    self.covariances[k] = P_pred
+
+                    # Use predicted position
+                    smoothed_keypoints.append(Keypoint(
+                        location=Point(x_pred[0], x_pred[1]),
+                        visibility=keypoint.visibility * 0.8,  # Reduce confidence
+                        keypoint_type=keypoint.keypoint_type
+                    ))
+                else:
+                    # No previous state, use noisy detection
+                    smoothed_keypoints.append(keypoint)
+            else:
+                # High confidence → Kalman update
+                z = np.array([keypoint.location.x, keypoint.location.y])
+
+                if self.states[k] is None:
+                    # Initialize
+                    self.states[k] = np.array([z[0], z[1], 0, 0])
+                    self.covariances[k] = np.eye(4) * 10
+                else:
+                    # Predict
+                    x_pred = self.F @ self.states[k]
+                    P_pred = self.F @ self.covariances[k] @ self.F.T + self.Q
+
+                    # Update
+                    y = z - (self.H @ x_pred)  # Innovation
+                    S = self.H @ P_pred @ self.H.T + self.R  # Innovation covariance
+                    K = P_pred @ self.H.T @ np.linalg.inv(S)  # Kalman gain
+
+                    x_updated = x_pred + K @ y
+                    P_updated = (np.eye(4) - K @ self.H) @ P_pred
+
+                    self.states[k] = x_updated
+                    self.covariances[k] = P_updated
+
+                # Create smoothed keypoint
+                smoothed_keypoints.append(Keypoint(
+                    location=Point(self.states[k][0], self.states[k][1]),
+                    visibility=keypoint.visibility,
+                    keypoint_type=keypoint.keypoint_type
+                ))
+
+        return Skeleton(
+            keypoints=smoothed_keypoints,
+            confidence=skeleton.confidence,
+            person_id=skeleton.person_id
+        )
+
+    def reset(self):
+        """Reset tracker state (call when video ends or person leaves frame)."""
+        self.states = [None] * 17
+        self.covariances = [None] * 17
+
+
+class PoseEstimationPipeline(Pipeline):
+    """
+    Complete human pose estimation system.
+
+    Mathematical Formulation:
+        PoseEstimation = Track ∘ BuildSkeleton ∘ DetectKeypoints ∘ Transform
+
+    Proof that PoseEstimation ∈ L_v:
+        - Transform: Resize, Normalize ∈ {Transform}
+        - DetectKeypoints: KeypointDetector ∈ {Detector}
+        - BuildSkeleton: Constructs graph from keypoints ∈ {Reasoner}
+        - Track: KalmanPoseTracker ∈ {Reasoner} (temporal smoothing)
+
+    Therefore, pose estimation is a composition of primitives. ∎
+
+    Use Cases:
+        - Fitness tracking (squat/pushup counting)
+        - Gesture recognition (control interfaces)
+        - Sports analysis (form correction)
+        - Healthcare (gait analysis, fall detection)
+        - Animation (motion capture)
+    """
+
+    def __init__(self, device: str = 'cpu', enable_tracking: bool = True):
+        """Initialize pose estimation pipeline."""
+        self.device = device
+        self.enable_tracking = enable_tracking
+
+        # Components
+        self.detector = KeypointDetector(model_type='hrnet', device=device)
+        self.tracker = KalmanPoseTracker() if enable_tracking else None
+
+        # Preprocessing
+        self.preprocess = Pipeline(
+            Resize(256, 256),  # HRNet expects 256×256 input
+            Normalize()
+        )
+
+        # Tracking state
+        self.pose_history = deque(maxlen=30)  # Keep last 30 frames
+
+    def __call__(self, image: Image) -> List[Skeleton]:
+        """
+        Estimate human poses in image.
+
+        Returns:
+            List of Skeleton objects (one per detected person)
+
+        Complexity:
+            O(H·W·k + K·n) where:
+            - H×W = image size
+            - k = CNN depth
+            - K = 17 keypoints
+            - n = number of people
+        """
+        # Step 1: Preprocess
+        preprocessed = self.preprocess(image)
+
+        # Step 2: Detect keypoints
+        skeletons = self.detector(preprocessed)
+
+        # Step 3: Temporal tracking (if enabled)
+        if self.enable_tracking and self.tracker is not None:
+            smoothed_skeletons = []
+            for skeleton in skeletons:
+                smoothed = self.tracker.update(skeleton)
+                smoothed_skeletons.append(smoothed)
+            skeletons = smoothed_skeletons
+
+        # Step 4: Store in history
+        self.pose_history.append(skeletons)
+
+        return skeletons
+
+    def get_pose_sequence(self, num_frames: int = 30) -> List[List[Skeleton]]:
+        """
+        Get recent pose sequence for temporal analysis.
+
+        Useful for activity recognition (e.g., "jumping jack", "squat").
+
+        Returns:
+            List of frame-wise skeletons
+        """
+        return list(self.pose_history)[-num_frames:]
+
+
+```
+
+---
+
+This continues the unified paradigm into Tier 2 with human pose estimation demonstrating temporal modeling capabilities. Shall I continue with the remaining Tier 2 chapters (Gesture Recognition, Image Segmentation, Object Tracking)?
