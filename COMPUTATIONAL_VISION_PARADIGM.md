@@ -3701,4 +3701,205 @@ class GestureRecognitionPipeline(Pipeline):
 
 ---
 
-This completes Chapter 6, demonstrating gesture recognition through temporal sequence modeling with three different approaches (C3D, LSTM, Transformer). All proven to be compositions of L_v primitives.
+### Chapter 7: Image Segmentation
+
+#### 7.1 Mathematical Formulation
+
+**Definition**: Image segmentation is the problem of partitioning an image into meaningful regions by assigning a label to every pixel.
+
+**Two Variants**:
+
+1. **Semantic Segmentation**: Classify each pixel into a category
+   $$f_{\text{semantic}}: \mathbb{R}^{H \times W \times 3} \rightarrow \{1, \ldots, C\}^{H \times W}$$
+   where $C$ is the number of classes (e.g., person, car, road, sky)
+
+2. **Instance Segmentation**: Separate individual object instances
+   $$f_{\text{instance}}: \mathbb{R}^{H \times W \times 3} \rightarrow \{(M_1, c_1), \ldots, (M_n, c_n)\}$$
+   where $M_i \in \{0,1\}^{H \times W}$ is a binary mask, $c_i$ is the class
+
+**Decomposition**:
+$$\text{Segmentation} = \text{Decode} \circ \text{Encode}_{\text{features}} \circ \text{Transform}$$
+
+Where:
+1. **Transform**: Preprocessing (resize, normalize)
+2. **Encode**: Extract multi-scale features via CNN
+3. **Decode**: Upsampling + pixel-wise classification
+
+#### 7.2 Algorithmic Analysis
+
+**Semantic Segmentation: U-Net** (Ronneberger et al., 2015):
+
+*Algorithm*:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Segmentation map S ∈ {1,...,C}^(H×W)
+
+Encoder (Contracting Path):
+    # Downsample and extract features
+    F₁ = Conv(I)  # H×W×64
+    F₂ = MaxPool(Conv(F₁))  # H/2×W/2×128
+    F₃ = MaxPool(Conv(F₂))  # H/4×W/4×256
+    F₄ = MaxPool(Conv(F₃))  # H/8×W/8×512
+
+    # Bottleneck
+    B = MaxPool(Conv(F₄))  # H/16×W/16×1024
+
+Decoder (Expanding Path):
+    # Upsample and combine with encoder features
+    U₄ = UpConv(B)  # H/8×W/8×512
+    U₄ = Concat(U₄, F₄)  # Skip connection
+    U₄ = Conv(U₄)
+
+    U₃ = UpConv(U₄)  # H/4×W/4×256
+    U₃ = Concat(U₃, F₃)
+    U₃ = Conv(U₃)
+
+    U₂ = UpConv(U₃)  # H/2×W/2×128
+    U₂ = Concat(U₂, F₂)
+    U₂ = Conv(U₂)
+
+    U₁ = UpConv(U₂)  # H×W×64
+    U₁ = Concat(U₁, F₁)
+    U₁ = Conv(U₁)
+
+Output Layer:
+    S = Conv1×1(U₁)  # H×W×C
+    S = argmax_c(S)  # Pixel-wise classification
+
+Return S
+```
+
+**Key Innovation**: Skip connections preserve spatial information lost during downsampling.
+
+**Complexity**:
+- Time: $O(H \cdot W \cdot k)$ where k = feature channels
+- Space: $O(H \cdot W \cdot k)$ for feature maps
+- Parameters: ~31M (standard U-Net)
+
+**Accuracy**:
+- Medical imaging: 92% IoU (ISBI cell segmentation)
+- Real-time: 10 FPS on 512×512 (GPU)
+
+---
+
+**Semantic Segmentation: DeepLab v3+** (Chen et al., 2018):
+
+*Key Components*:
+
+1. **Atrous Spatial Pyramid Pooling (ASPP)**:
+   ```
+   # Capture multi-scale context
+   For each rate r in {6, 12, 18}:
+       F_r = AtrousConv(features, rate=r)
+
+   # Combine multi-scale features
+   F_aspp = Concat(F_6, F_12, F_18, GlobalPool(features))
+   F_aspp = Conv1×1(F_aspp)
+   ```
+
+2. **Atrous Convolution**:
+   - Regular convolution with "holes" (dilated)
+   - Increases receptive field without losing resolution
+   - Rate $r$ → effective kernel size: $k + (k-1)(r-1)$
+
+**Algorithm**:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Segmentation S ∈ {1,...,C}^(H×W)
+
+Encoder:
+    # Modified ResNet backbone with atrous convolution
+    F = ResNet101_backbone(I, output_stride=16)
+    # F ∈ ℝ^(H/16×W/16×2048)
+
+ASPP Module:
+    # Multi-scale features
+    F_aspp = ASPP(F, rates=[6, 12, 18])
+    # F_aspp ∈ ℝ^(H/16×W/16×256)
+
+Decoder:
+    # Low-level features from early layers
+    F_low = Conv1×1(encoder.layer1_output)  # H/4×W/4×48
+
+    # Upsample and concatenate
+    F_up = Upsample(F_aspp, scale=4)  # H/4×W/4×256
+    F_concat = Concat(F_up, F_low)
+    F_refined = Conv3×3(F_concat)
+
+    # Final upsampling
+    S_logits = Upsample(F_refined, scale=4)  # H×W×C
+    S = argmax_c(S_logits)
+
+Return S
+```
+
+**Complexity**:
+- Time: $O(H \cdot W \cdot k)$
+- Space: $O(H \cdot W \cdot k)$
+- Parameters: ~41M (DeepLab v3+ with ResNet-101)
+
+**Accuracy**:
+- PASCAL VOC 2012: 89.0% mIoU
+- Cityscapes: 82.1% mIoU
+- Real-time: 5 FPS on 1024×2048 (GPU)
+
+---
+
+**Instance Segmentation: Mask R-CNN** (He et al., 2017):
+
+*Algorithm*:
+```
+Input: Image I ∈ ℝ^(H×W×3)
+Output: Instance masks {(M₁, c₁, b₁), ..., (Mₙ, cₙ, bₙ)}
+        where Mᵢ = binary mask, cᵢ = class, bᵢ = bbox
+
+Stage 1 - Region Proposal (RPN):
+    # Propose candidate object regions
+    F = ResNet_backbone(I)
+    proposals = RegionProposalNetwork(F)
+    # proposals = list of bounding boxes
+
+Stage 2 - RoI Classification and Mask Prediction:
+    For each proposal p:
+        # RoI Align (precise feature extraction)
+        roi_features = RoIAlign(F, p)  # 7×7×2048
+
+        # Classification branch
+        class_logits = FC(GlobalPool(roi_features))
+        c = argmax(class_logits)
+
+        # Bounding box regression
+        bbox_deltas = FC(GlobalPool(roi_features))
+        b = ApplyDeltas(p, bbox_deltas)
+
+        # Mask branch (FCN on RoI)
+        mask_logits = Conv(roi_features)  # 28×28×C
+        M = Sigmoid(mask_logits[c])  # Binary mask for predicted class
+        M = Resize(M, bbox_size)
+
+        If max(class_logits) > threshold:
+            results.add((M, c, b))
+
+Post-processing:
+    # Non-maximum suppression
+    results = NMS(results, iou_threshold=0.5)
+
+Return results
+```
+
+**Key Innovations**:
+1. **RoI Align**: Avoids quantization errors (unlike RoI Pooling)
+2. **Mask Branch**: Parallel to classification, predicts pixel-wise mask
+3. **Multi-task Loss**: $L = L_{\text{cls}} + L_{\text{box}} + L_{\text{mask}}$
+
+**Complexity**:
+- Time: $O(H \cdot W \cdot k + n \cdot 7^2 \cdot k)$ where n = proposals
+- Space: $O(H \cdot W \cdot k)$
+- Parameters: ~44M (Mask R-CNN with ResNet-50-FPN)
+
+**Accuracy**:
+- COCO instance segmentation: AP 37.1%
+- COCO detection: AP 39.8%
+- Real-time: 5 FPS on 800×1333 (GPU)
+
+This completes Chapter 7 on Image Segmentation, covering both semantic and instance approaches.
