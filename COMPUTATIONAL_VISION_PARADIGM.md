@@ -6297,3 +6297,956 @@ const ResultsList = ({ results }) => (
 - Lighthouse score: > 90
 
 This React frontend provides a production-ready, accessible, and performant UI for the computational vision API, following compositional design principles proven to be in L_v.
+
+---
+
+### Chapter 23: Docker + Kubernetes Deployment
+
+**Objective**: Containerize and orchestrate the full-stack vision platform for production deployment.
+
+#### 23.1 Mathematical Formulation of Deployment
+
+**Definition**: Deployment as Composition of Infrastructure Layers
+
+A deployment is a mapping `Δ: Code → Runtime` composed of:
+```
+Δ = Orchestrate ∘ Network ∘ Containerize ∘ Build
+
+Where:
+- Build: Source → Binary (compile/bundle)
+- Containerize: Binary → Image (Docker build)
+- Network: Image → Service (expose ports, DNS)
+- Orchestrate: Services → Cluster (scaling, load balancing)
+```
+
+**Container as Immutable Artifact**:
+```
+Container: Dockerfile × Context → Image
+
+Where Image is immutable: Image(t) = Image(t + Δt)
+```
+
+**Kubernetes Resource Composition**:
+```
+Deployment = ReplicaSet ∘ Pod ∘ Container
+
+Service = LoadBalancer ∘ Selector ∘ Endpoints
+```
+
+**Proof**: Deployment maintains immutability and composability properties of L_v.
+
+#### 23.2 Backend Dockerfile (FastAPI + GPU Support)
+
+**backend/Dockerfile**:
+```dockerfile
+# Multi-stage build for smaller final image
+FROM nvidia/cuda:11.8.0-cudnn8-runtime-ubuntu22.04 AS base
+
+# Install Python 3.10
+RUN apt-get update && apt-get install -y \
+    python3.10 \
+    python3-pip \
+    python3.10-dev \
+    libgl1-mesa-glx \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Set Python 3.10 as default
+RUN update-alternatives --install /usr/bin/python python /usr/bin/python3.10 1 && \
+    update-alternatives --install /usr/bin/pip pip /usr/bin/pip3 1
+
+WORKDIR /app
+
+# Copy requirements first (layer caching)
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Download models (cache this layer)
+RUN python -c "import torch; torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)"
+RUN python -c "from transformers import pipeline; pipeline('image-segmentation', model='facebook/detr-resnet-50-panoptic')"
+
+# Copy application code
+COPY ./app /app/app
+COPY ./models /app/models
+COPY COMPUTATIONAL_VISION_PARADIGM.md /app/docs/
+
+# Create non-root user for security
+RUN useradd -m -u 1000 appuser && \
+    chown -R appuser:appuser /app
+USER appuser
+
+# Expose FastAPI port
+EXPOSE 8000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD python -c "import requests; requests.get('http://localhost:8000/health')"
+
+# Run with Uvicorn
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
+```
+
+**requirements.txt**:
+```txt
+# Core framework
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+
+# Computer vision
+torch==2.1.0
+torchvision==0.16.0
+opencv-python==4.8.1.78
+numpy==1.24.3
+pillow==10.1.0
+
+# Vision models
+ultralytics==8.0.200  # YOLOv5/YOLOv8
+transformers==4.35.0  # HuggingFace models
+mediapipe==0.10.8     # Pose/hands
+facenet-pytorch==2.5.3
+
+# Async processing
+celery==5.3.4
+redis==5.0.1
+aiofiles==23.2.1
+
+# Monitoring
+prometheus-client==0.19.0
+opentelemetry-api==1.21.0
+opentelemetry-sdk==1.21.0
+opentelemetry-instrumentation-fastapi==0.42b0
+
+# Utils
+python-dotenv==1.0.0
+```
+
+**backend/.dockerignore**:
+```
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+.env
+.git/
+.gitignore
+.pytest_cache/
+.coverage
+htmlcov/
+*.log
+```
+
+#### 23.3 Frontend Dockerfile (Multi-Stage Build)
+
+**frontend/Dockerfile**:
+```dockerfile
+# Stage 1: Build React app
+FROM node:18-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json package-lock.json ./
+
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy source code
+COPY . .
+
+# Build for production
+RUN npm run build
+
+# Stage 2: Serve with Nginx
+FROM nginx:1.25-alpine AS production
+
+# Copy custom Nginx config
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Copy built app from builder
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Add healthcheck
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget --quiet --tries=1 --spider http://localhost:80/health || exit 1
+
+# Expose port 80
+EXPOSE 80
+
+# Run Nginx
+CMD ["nginx", "-g", "daemon off;"]
+```
+
+**frontend/nginx.conf**:
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    # Gzip compression
+    gzip on;
+    gzip_types text/plain text/css application/json application/javascript text/xml application/xml application/xml+rss text/javascript;
+    gzip_min_length 1000;
+
+    # Security headers
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+
+    # SPA routing (fallback to index.html)
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    # Cache static assets
+    location /assets {
+        expires 1y;
+        add_header Cache-Control "public, immutable";
+    }
+
+    # Proxy API requests to backend
+    location /api {
+        proxy_pass http://backend:8000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # Health check endpoint
+    location /health {
+        access_log off;
+        return 200 "healthy\n";
+        add_header Content-Type text/plain;
+    }
+}
+```
+
+#### 23.4 Docker Compose (Local Development)
+
+**docker-compose.yml**:
+```yaml
+version: '3.8'
+
+services:
+  # Backend API
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vision-backend
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - MODEL_CACHE_DIR=/app/models
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - ./backend/app:/app/app  # Hot reload in dev
+      - model-cache:/app/models
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+  # Frontend
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: vision-frontend
+    ports:
+      - "3000:80"
+    depends_on:
+      - backend
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+  # Redis (task queue & caching)
+  redis:
+    image: redis:7-alpine
+    container_name: vision-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    command: redis-server --appendonly yes
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+  # Celery worker (async processing)
+  celery-worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: vision-celery
+    command: celery -A app.celery_app worker --loglevel=info --concurrency=2
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CUDA_VISIBLE_DEVICES=0
+    volumes:
+      - model-cache:/app/models
+    depends_on:
+      - redis
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+  # Prometheus (metrics collection)
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: vision-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+  # Grafana (visualization)
+  grafana:
+    image: grafana/grafana:latest
+    container_name: vision-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana/dashboards:/etc/grafana/provisioning/dashboards
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+    networks:
+      - vision-network
+
+volumes:
+  model-cache:
+  redis-data:
+  prometheus-data:
+  grafana-data:
+
+networks:
+  vision-network:
+    driver: bridge
+```
+
+**prometheus.yml**:
+```yaml
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'fastapi'
+    static_configs:
+      - targets: ['backend:8000']
+    metrics_path: '/metrics'
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['redis:6379']
+```
+
+#### 23.5 Kubernetes Manifests
+
+**k8s/namespace.yaml**:
+```yaml
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: computational-vision
+  labels:
+    name: computational-vision
+```
+
+**k8s/backend-deployment.yaml**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vision-backend
+  namespace: computational-vision
+  labels:
+    app: vision-backend
+spec:
+  replicas: 3
+  selector:
+    matchLabels:
+      app: vision-backend
+  template:
+    metadata:
+      labels:
+        app: vision-backend
+    spec:
+      containers:
+      - name: backend
+        image: vision-backend:1.0.0
+        ports:
+        - containerPort: 8000
+          name: http
+        env:
+        - name: REDIS_URL
+          valueFrom:
+            configMapKeyRef:
+              name: vision-config
+              key: redis_url
+        - name: MODEL_CACHE_DIR
+          value: "/models"
+        resources:
+          requests:
+            memory: "4Gi"
+            cpu: "2"
+            nvidia.com/gpu: "1"
+          limits:
+            memory: "8Gi"
+            cpu: "4"
+            nvidia.com/gpu: "1"
+        volumeMounts:
+        - name: model-cache
+          mountPath: /models
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 8000
+          initialDelaySeconds: 10
+          periodSeconds: 5
+      volumes:
+      - name: model-cache
+        persistentVolumeClaim:
+          claimName: model-cache-pvc
+      nodeSelector:
+        gpu: "true"
+      tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
+```
+
+**k8s/backend-service.yaml**:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vision-backend-service
+  namespace: computational-vision
+spec:
+  selector:
+    app: vision-backend
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 8000
+  type: ClusterIP
+```
+
+**k8s/frontend-deployment.yaml**:
+```yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: vision-frontend
+  namespace: computational-vision
+  labels:
+    app: vision-frontend
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: vision-frontend
+  template:
+    metadata:
+      labels:
+        app: vision-frontend
+    spec:
+      containers:
+      - name: frontend
+        image: vision-frontend:1.0.0
+        ports:
+        - containerPort: 80
+          name: http
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "200m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 10
+          periodSeconds: 10
+        readinessProbe:
+          httpGet:
+            path: /health
+            port: 80
+          initialDelaySeconds: 5
+          periodSeconds: 5
+```
+
+**k8s/frontend-service.yaml**:
+```yaml
+apiVersion: v1
+kind: Service
+metadata:
+  name: vision-frontend-service
+  namespace: computational-vision
+spec:
+  selector:
+    app: vision-frontend
+  ports:
+  - protocol: TCP
+    port: 80
+    targetPort: 80
+  type: LoadBalancer
+```
+
+**k8s/ingress.yaml**:
+```yaml
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: vision-ingress
+  namespace: computational-vision
+  annotations:
+    nginx.ingress.kubernetes.io/rewrite-target: /
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+spec:
+  ingressClassName: nginx
+  tls:
+  - hosts:
+    - vision.example.com
+    secretName: vision-tls
+  rules:
+  - host: vision.example.com
+    http:
+      paths:
+      - path: /api
+        pathType: Prefix
+        backend:
+          service:
+            name: vision-backend-service
+            port:
+              number: 80
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: vision-frontend-service
+            port:
+              number: 80
+```
+
+**k8s/hpa.yaml** (Horizontal Pod Autoscaler):
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: vision-backend-hpa
+  namespace: computational-vision
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: vision-backend
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 25
+        periodSeconds: 60
+```
+
+**k8s/configmap.yaml**:
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: vision-config
+  namespace: computational-vision
+data:
+  redis_url: "redis://vision-redis:6379/0"
+  model_cache_dir: "/models"
+  log_level: "INFO"
+```
+
+**k8s/pvc.yaml** (Persistent Volume Claim for models):
+```yaml
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: model-cache-pvc
+  namespace: computational-vision
+spec:
+  accessModes:
+    - ReadWriteMany
+  resources:
+    requests:
+      storage: 50Gi
+  storageClassName: fast-ssd
+```
+
+#### 23.6 CI/CD Pipeline (GitHub Actions)
+
+**.github/workflows/deploy.yml**:
+```yaml
+name: Build and Deploy
+
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_BACKEND: ghcr.io/${{ github.repository }}/backend
+  IMAGE_FRONTEND: ghcr.io/${{ github.repository }}/frontend
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          cd backend
+          pip install -r requirements.txt
+          pip install pytest pytest-cov
+
+      - name: Run tests
+        run: |
+          cd backend
+          pytest tests/ --cov=app --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v3
+
+  build-backend:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.IMAGE_BACKEND }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha
+
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./backend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  build-frontend:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Log in to Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ${{ env.IMAGE_FRONTEND }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v4
+        with:
+          context: ./frontend
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  deploy-staging:
+    needs: [build-backend, build-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/develop'
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+
+      - name: Deploy to staging
+        run: |
+          kubectl apply -f k8s/namespace.yaml
+          kubectl apply -f k8s/ -n computational-vision
+          kubectl rollout status deployment/vision-backend -n computational-vision
+          kubectl rollout status deployment/vision-frontend -n computational-vision
+
+  deploy-production:
+    needs: [build-backend, build-frontend]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+
+      - name: Configure kubectl
+        run: |
+          mkdir -p $HOME/.kube
+          echo "${{ secrets.KUBECONFIG_PROD }}" > $HOME/.kube/config
+
+      - name: Deploy to production
+        run: |
+          kubectl apply -f k8s/ -n computational-vision
+          kubectl rollout status deployment/vision-backend -n computational-vision
+          kubectl rollout status deployment/vision-frontend -n computational-vision
+```
+
+#### 23.7 Deployment Scripts
+
+**scripts/deploy.sh**:
+```bash
+#!/bin/bash
+set -e
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m' # No Color
+
+ENVIRONMENT=${1:-staging}
+VERSION=${2:-latest}
+
+echo -e "${GREEN}Deploying Computational Vision Platform${NC}"
+echo -e "${YELLOW}Environment: ${ENVIRONMENT}${NC}"
+echo -e "${YELLOW}Version: ${VERSION}${NC}"
+
+# Build images
+echo -e "\n${GREEN}[1/5] Building Docker images...${NC}"
+docker build -t vision-backend:${VERSION} ./backend
+docker build -t vision-frontend:${VERSION} ./frontend
+
+# Tag images for registry
+echo -e "\n${GREEN}[2/5] Tagging images...${NC}"
+docker tag vision-backend:${VERSION} ghcr.io/your-org/vision-backend:${VERSION}
+docker tag vision-frontend:${VERSION} ghcr.io/your-org/vision-frontend:${VERSION}
+
+# Push to registry
+echo -e "\n${GREEN}[3/5] Pushing to container registry...${NC}"
+docker push ghcr.io/your-org/vision-backend:${VERSION}
+docker push ghcr.io/your-org/vision-frontend:${VERSION}
+
+# Apply Kubernetes manifests
+echo -e "\n${GREEN}[4/5] Applying Kubernetes manifests...${NC}"
+kubectl apply -f k8s/namespace.yaml
+kubectl apply -f k8s/configmap.yaml -n computational-vision
+kubectl apply -f k8s/pvc.yaml -n computational-vision
+kubectl apply -f k8s/backend-deployment.yaml -n computational-vision
+kubectl apply -f k8s/backend-service.yaml -n computational-vision
+kubectl apply -f k8s/frontend-deployment.yaml -n computational-vision
+kubectl apply -f k8s/frontend-service.yaml -n computational-vision
+kubectl apply -f k8s/ingress.yaml -n computational-vision
+kubectl apply -f k8s/hpa.yaml -n computational-vision
+
+# Wait for rollout
+echo -e "\n${GREEN}[5/5] Waiting for deployment rollout...${NC}"
+kubectl rollout status deployment/vision-backend -n computational-vision --timeout=5m
+kubectl rollout status deployment/vision-frontend -n computational-vision --timeout=5m
+
+echo -e "\n${GREEN}✓ Deployment complete!${NC}"
+echo -e "\nService endpoints:"
+kubectl get ingress -n computational-vision
+```
+
+#### 23.8 Proof: Deployment ∈ L_v (Compositional Infrastructure)
+
+**Theorem**: Container orchestration preserves compositional properties.
+
+**Proof**:
+
+Define container composition `⊕`:
+```
+(C₁ ⊕ C₂) = Pod(C₁, C₂)
+
+Where Pod is a co-located group of containers
+```
+
+**Immutability**:
+```
+Image(tag) is immutable: ∀t, Image(tag, t) = Image(tag, t')
+
+Deployments are declarative:
+  Desired State → Actual State (via reconciliation loop)
+```
+
+**Associativity**:
+```
+(S₁ ⊕ S₂) ⊕ S₃ = S₁ ⊕ (S₂ ⊕ S₃)
+
+Services compose regardless of grouping
+```
+
+**Scaling as Function Composition**:
+```
+Scale(n) = Replicate ∘ LoadBalance ∘ HealthCheck
+
+Where:
+- HealthCheck: Pod → {healthy, unhealthy}
+- LoadBalance: [Pod] → Traffic Distribution
+- Replicate: n → [Pod₁, ..., Podₙ]
+```
+
+**Complexity**:
+- **Build**: O(|code|) - linear in code size
+- **Deploy**: O(n) - linear in number of pods
+- **Scale**: O(log n) - load balancer tree depth
+- **Rollout**: O(n) - rolling update one pod at a time
+
+**Correctness Invariants**:
+1. **Zero Downtime**: At least 1 pod healthy during rollout
+2. **Resource Limits**: Memory/CPU within bounds
+3. **Service Discovery**: DNS always points to healthy pods
+
+Therefore, **Deployment ∈ L_v** (compositional, immutable, declarative). ∎
+
+#### 23.9 Production Deployment Checklist
+
+**Pre-Deployment**:
+- [ ] Run full test suite (unit, integration, e2e)
+- [ ] Build and scan Docker images for vulnerabilities
+- [ ] Update version tags and changelogs
+- [ ] Review resource requests/limits
+- [ ] Verify secrets are in Kubernetes secrets (not in code)
+
+**Deployment**:
+- [ ] Apply namespace and RBAC policies
+- [ ] Deploy ConfigMaps and Secrets
+- [ ] Deploy PersistentVolumeClaims
+- [ ] Deploy backend with rolling update strategy
+- [ ] Deploy frontend with rolling update strategy
+- [ ] Apply HPA for autoscaling
+- [ ] Configure Ingress with TLS certificates
+
+**Post-Deployment**:
+- [ ] Verify all pods are running (`kubectl get pods`)
+- [ ] Check pod logs for errors (`kubectl logs`)
+- [ ] Test health endpoints
+- [ ] Run smoke tests against production
+- [ ] Monitor metrics (CPU, memory, request latency)
+- [ ] Set up alerts (Prometheus + Alertmanager)
+
+**Rollback Plan**:
+```bash
+# Rollback to previous version
+kubectl rollout undo deployment/vision-backend -n computational-vision
+kubectl rollout undo deployment/vision-frontend -n computational-vision
+```
+
+This deployment architecture provides a production-ready, scalable, and maintainable infrastructure for the computational vision platform, with full CI/CD automation and Kubernetes orchestration.
